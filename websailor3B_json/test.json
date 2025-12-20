@@ -1,0 +1,28 @@
+[
+    {
+        "question": "问题文本",
+        "answer": "34689",
+        "prediction": "34689",
+        "rollout_id": 1,
+        "messages": [
+            {"role": "system", "content": "..."},
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "<think>...</think><tool_call>...</tool_call>"},
+            {"role": "user", "content": "<tool_response>...</tool_response>"},
+            {"role": "assistant", "content": "<think>...</think><answer>...</answer>"}
+        ]
+    },
+    {
+        "question": "问题文本",
+        "answer": "34689",
+        "prediction": "34689",
+        "rollout_id": 1,
+        "messages": [
+            {"role": "system", "content": "..."},
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "<think>...</think><tool_call>...</tool_call>"},
+            {"role": "user", "content": "<tool_response>...</tool_response>"},
+            {"role": "assistant", "content": "<think>...</think><answer>...</answer>"}
+        ]
+    }
+]

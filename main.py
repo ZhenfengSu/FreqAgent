@@ -589,10 +589,10 @@ def main():
     visualizer = TrajectoryVisualizer(trajectory_analyzer, spectral_analyzer)
     
     # 绘制各种图表
-    visualizer.plot_segment_statistics()
-    visualizer.plot_spectrogram()
-    visualizer.plot_energy_decay_curves()
-    visualizer.plot_spectral_metrics_comparison()
+    visualizer.plot_segment_statistics(save_path='./segment_statistics.png')
+    visualizer.plot_spectrogram(save_path='./spectrogram.png')
+    visualizer.plot_energy_decay_curves(save_path='./energy_decay_curves.png')
+    visualizer.plot_spectral_metrics_comparison(save_path='./spectral_metrics_comparison.png')
     
     
     return results

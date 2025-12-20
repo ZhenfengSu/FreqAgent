@@ -1,0 +1,135 @@
+{
+  "timestamp": "2025-12-20T13:50:58.060195",
+  "report": {
+    "total_trajectories": 2,
+    "correct_predictions": 0,
+    "accuracy": 0.0,
+    "aggregate_metrics": {
+      "think": {
+        "count": 6,
+        "entropy_mean": 0.8939796458142122,
+        "entropy_std": 0.011735635763609928,
+        "hfr_mean": 0.10185150833967888,
+        "concentration_mean": 0.5134515522126263
+      },
+      "tool_call": {
+        "count": 6,
+        "entropy_mean": 0.9034146970598157,
+        "entropy_std": 0.004174509139010156,
+        "hfr_mean": 0.10244060185222255,
+        "concentration_mean": 0.39614222873476174
+      },
+      "tool_response": {
+        "count": 4,
+        "entropy_mean": 0.9205003250468484,
+        "entropy_std": 2.8180596227112e-06,
+        "hfr_mean": 0.09895462589636383,
+        "concentration_mean": 0.3934096167404416
+      }
+    }
+  },
+  "trajectories": [
+    {
+      "trajectory_id": 1,
+      "question": "I'm researching species that became invasive after people who kept them as pets released them...",
+      "answer": "34689",
+      "prediction": "The clown anemonefish was first reported at Fred Howard Park, Florida (zip code 34689).",
+      "is_correct": false,
+      "token_count": 314,
+      "layer_idx": 27,
+      "summary": {
+        "think": {
+          "count": 3,
+          "spectral_entropy_mean": 0.8939796458142122,
+          "spectral_entropy_std": 0.011735635763609928,
+          "high_freq_ratio_mean": 0.10185150833967889,
+          "low_freq_ratio_mean": 0.42322624456807856,
+          "energy_concentration_mean": 0.5134515522126263
+        },
+        "tool_call": {
+          "count": 3,
+          "spectral_entropy_mean": 0.9034146970598157,
+          "spectral_entropy_std": 0.004174509139010156,
+          "high_freq_ratio_mean": 0.10244060185222255,
+          "low_freq_ratio_mean": 0.444096847570907,
+          "energy_concentration_mean": 0.39614222873476174
+        },
+        "tool_response": {
+          "count": 2,
+          "spectral_entropy_mean": 0.9205003250468484,
+          "spectral_entropy_std": 2.8180596227112e-06,
+          "high_freq_ratio_mean": 0.09895462589636383,
+          "low_freq_ratio_mean": 0.4049620339353387,
+          "energy_concentration_mean": 0.3934096167404416
+        },
+        "system": {
+          "count": 1,
+          "spectral_entropy_mean": 0.9179213927865607,
+          "spectral_entropy_std": 0.0,
+          "high_freq_ratio_mean": 0.12351966831995008,
+          "low_freq_ratio_mean": 0.18632027286090777,
+          "energy_concentration_mean": 0.6276383306280178
+        },
+        "user": {
+          "count": 1,
+          "spectral_entropy_mean": 0.9193631628760959,
+          "spectral_entropy_std": 0.0,
+          "high_freq_ratio_mean": 0.1897879989757616,
+          "low_freq_ratio_mean": 0.22626113702753478,
+          "energy_concentration_mean": 0.627782633123144
+        }
+      }
+    },
+    {
+      "trajectory_id": 1,
+      "question": "I'm researching species that became invasive after people who kept them as pets released them...",
+      "answer": "34689",
+      "prediction": "The clown anemonefish was first reported at Fred Howard Park, Florida (zip code 34689).",
+      "is_correct": false,
+      "token_count": 314,
+      "layer_idx": 27,
+      "summary": {
+        "think": {
+          "count": 3,
+          "spectral_entropy_mean": 0.8939796458142122,
+          "spectral_entropy_std": 0.011735635763609928,
+          "high_freq_ratio_mean": 0.10185150833967889,
+          "low_freq_ratio_mean": 0.42322624456807856,
+          "energy_concentration_mean": 0.5134515522126263
+        },
+        "tool_call": {
+          "count": 3,
+          "spectral_entropy_mean": 0.9034146970598157,
+          "spectral_entropy_std": 0.004174509139010156,
+          "high_freq_ratio_mean": 0.10244060185222255,
+          "low_freq_ratio_mean": 0.444096847570907,
+          "energy_concentration_mean": 0.39614222873476174
+        },
+        "tool_response": {
+          "count": 2,
+          "spectral_entropy_mean": 0.9205003250468484,
+          "spectral_entropy_std": 2.8180596227112e-06,
+          "high_freq_ratio_mean": 0.09895462589636383,
+          "low_freq_ratio_mean": 0.4049620339353387,
+          "energy_concentration_mean": 0.3934096167404416
+        },
+        "system": {
+          "count": 1,
+          "spectral_entropy_mean": 0.9179213927865607,
+          "spectral_entropy_std": 0.0,
+          "high_freq_ratio_mean": 0.12351966831995008,
+          "low_freq_ratio_mean": 0.18632027286090777,
+          "energy_concentration_mean": 0.6276383306280178
+        },
+        "user": {
+          "count": 1,
+          "spectral_entropy_mean": 0.9193631628760959,
+          "spectral_entropy_std": 0.0,
+          "high_freq_ratio_mean": 0.1897879989757616,
+          "low_freq_ratio_mean": 0.22626113702753478,
+          "energy_concentration_mean": 0.627782633123144
+        }
+      }
+    }
+  ]
+}
