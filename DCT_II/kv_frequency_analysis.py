@@ -1,6 +1,6 @@
 """
 基于频域分析的大模型思维与工具调用模式研究
-KV Cache Frequency Domain Analysis for LLM Thinking and Tool-Calling Patterns
+修复版本：优化内存使用，支持大规模数据处理
 """
 
 import json
@@ -14,6 +14,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import warnings
+import gc
+import os
+
 warnings.filterwarnings('ignore')
 
 
@@ -24,19 +27,10 @@ warnings.filterwarnings('ignore')
 @dataclass
 class SemanticSegment:
     """语义片段数据结构"""
-    segment_type: str  # 'think', 'tool_call', 'tool_response', 'answer'
-    start_pos: int     # 在token序列中的起始位置
-    end_pos: int       # 在token序列中的结束位置
-    text: str          # 原始文本内容
-
-
-@dataclass
-class SampleKVData:
-    """单个样本的KV数据"""
-    sample_id: int
-    segments: List[SemanticSegment]
-    key_cache: torch.Tensor    # [num_layers, seq_len, num_heads, head_dim]
-    value_cache: torch.Tensor  # [num_layers, seq_len, num_heads, head_dim]
+    segment_type: str
+    start_pos: int
+    end_pos: int
+    text: str
 
 
 # ============================================================================
@@ -51,51 +45,21 @@ class DataLoader:
         self.data = self._load_json()
     
     def _load_json(self) -> List[Dict]:
-        """加载JSON数据"""
         with open(self.json_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
     def extract_assistant_contents(self) -> List[str]:
-        """
-        提取所有assistant角色的内容，合并为完整对话
-        返回每个样本的完整assistant内容
-        """
         all_samples = []
-        
         for item in self.data:
             messages = item.get('messages', [])
             assistant_contents = []
-            
             for msg in messages:
                 if msg.get('role') == 'assistant':
                     content = msg.get('content', '')
                     assistant_contents.append(content)
-            
-            # 将同一样本的所有assistant内容合并
             full_content = ''.join(assistant_contents)
             all_samples.append(full_content)
-        
         return all_samples
-    
-    def get_full_conversations(self) -> List[str]:
-        """
-        获取完整对话（用于模型推理）
-        """
-        all_conversations = []
-        
-        for item in self.data:
-            messages = item.get('messages', [])
-            # 构建完整对话文本
-            conversation_parts = []
-            for msg in messages:
-                role = msg.get('role', '')
-                content = msg.get('content', '')
-                conversation_parts.append(f"<|{role}|>\n{content}")
-            
-            full_conversation = '\n'.join(conversation_parts)
-            all_conversations.append(full_conversation)
-        
-        return all_conversations
 
 
 # ============================================================================
@@ -103,38 +67,26 @@ class DataLoader:
 # ============================================================================
 
 class SemanticSlicer:
-    """语义切片器 - 基于特殊标记定位不同语义区域"""
+    """语义切片器"""
     
-    # 定义语义标记的正则模式
     PATTERNS = {
         'think': (r'<think>', r'</think>'),
         'tool_call': (r'<tool_call>', r'</tool_call>'),
         'tool_response': (r'<tool_response>', r'</tool_response>'),
-        'answer': (r'<answer>', r'</answer>'),
     }
     
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
     
     def find_segments_in_text(self, text: str) -> List[Tuple[str, int, int, str]]:
-        """
-        在文本中找到所有语义片段的字符位置
-        返回: [(segment_type, char_start, char_end, content), ...]
-        """
         segments = []
-        
         for seg_type, (open_tag, close_tag) in self.PATTERNS.items():
-            # 构建匹配模式
-            pattern = f'{open_tag}(.*?){close_tag}'
-            
+            pattern = f'{re.escape(open_tag)}(.*?){re.escape(close_tag)}'
             for match in re.finditer(pattern, text, re.DOTALL):
                 content = match.group(1)
-                # 记录整个标签（包括开闭标签）的位置
                 char_start = match.start()
                 char_end = match.end()
                 segments.append((seg_type, char_start, char_end, content))
-        
-        # 按位置排序
         segments.sort(key=lambda x: x[1])
         return segments
     
@@ -144,33 +96,23 @@ class SemanticSlicer:
         char_segments: List[Tuple[str, int, int, str]],
         input_ids: torch.Tensor
     ) -> List[SemanticSegment]:
-        """
-        将字符位置转换为token位置
-        """
-        # 获取每个token对应的字符范围
         encoding = self.tokenizer(text, return_offsets_mapping=True, return_tensors='pt')
-        offset_mapping = encoding['offset_mapping'][0]  # [seq_len, 2]
+        offset_mapping = encoding['offset_mapping'][0]
         
         token_segments = []
-        
         for seg_type, char_start, char_end, content in char_segments:
-            # 找到对应的token范围
             token_start = None
             token_end = None
             
             for idx, (tok_start, tok_end) in enumerate(offset_mapping.tolist()):
-                if tok_start == tok_end == 0:  # 特殊token
+                if tok_start == tok_end == 0:
                     continue
-                
-                # 找起始token
                 if token_start is None and tok_end > char_start:
                     token_start = idx
-                
-                # 找结束token
                 if tok_start < char_end:
                     token_end = idx + 1
             
-            if token_start is not None and token_end is not None:
+            if token_start is not None and token_end is not None and token_end > token_start:
                 token_segments.append(SemanticSegment(
                     segment_type=seg_type,
                     start_pos=token_start,
@@ -180,32 +122,187 @@ class SemanticSlicer:
         
         return token_segments
     
-    def slice_by_special_tokens(
-        self, 
-        input_ids: torch.Tensor, 
-        text: str
-    ) -> List[SemanticSegment]:
-        """
-        主切片方法：结合文本解析和token位置映射
-        """
-        # 在文本中找到语义片段
+    def slice_by_special_tokens(self, input_ids: torch.Tensor, text: str) -> List[SemanticSegment]:
         char_segments = self.find_segments_in_text(text)
-        
         if not char_segments:
             return []
-        
-        # 转换为token位置
-        token_segments = self.char_to_token_positions(text, char_segments, input_ids)
-        
-        return token_segments
+        return self.char_to_token_positions(text, char_segments, input_ids)
 
 
 # ============================================================================
-# 4. KV Cache 提取器
+# 4. 频域分析器（内存优化版）
+# ============================================================================
+
+class FrequencyAnalyzer:
+    """频域分析器 - 内存优化版"""
+    
+    def __init__(self, target_length: int = 128):
+        self.target_length = target_length
+    
+    def dct_fast(self, x: np.ndarray) -> np.ndarray:
+        from scipy.fftpack import dct
+        return dct(x, type=2, norm='ortho')
+    
+    def resample_segment(self, segment: torch.Tensor) -> torch.Tensor:
+        """将变长片段重采样到固定长度"""
+        original_shape = segment.shape
+        seq_len = original_shape[0]
+        
+        if seq_len == self.target_length:
+            return segment
+        
+        if seq_len < 2:
+            # 序列太短，返回零张量
+            return torch.zeros(self.target_length, *original_shape[1:])
+        
+        if len(original_shape) == 3:
+            segment_flat = segment.reshape(seq_len, -1).permute(1, 0)
+            features = segment_flat.shape[0]
+        else:
+            segment_flat = segment.permute(1, 0)
+            features = segment_flat.shape[0]
+        
+        segment_3d = segment_flat.unsqueeze(0).float()
+        
+        resampled = F.interpolate(
+            segment_3d, 
+            size=self.target_length, 
+            mode='linear', 
+            align_corners=False
+        )
+        
+        resampled = resampled.squeeze(0).permute(1, 0)
+        
+        if len(original_shape) == 3:
+            num_heads = original_shape[1]
+            head_dim = original_shape[2]
+            resampled = resampled.reshape(self.target_length, num_heads, head_dim)
+        
+        return resampled
+    
+    def normalize_segment(self, segment: torch.Tensor) -> torch.Tensor:
+        """Z-Score归一化"""
+        mean = segment.mean(dim=0, keepdim=True)
+        std = segment.std(dim=0, keepdim=True) + 1e-8
+        return (segment - mean) / std
+    
+    def compute_power_spectrum_reduced(self, segment: np.ndarray) -> np.ndarray:
+        """
+        计算功率谱 - 直接返回降维后的结果
+        
+        Args:
+            segment: [target_length, num_heads, head_dim]
+        
+        Returns:
+            power_curve: [target_length] - 已经对 heads 和 dim 取平均
+        """
+        target_len, num_heads, head_dim = segment.shape
+        
+        # 累积功率谱，直接求和而不是存储完整矩阵
+        power_sum = np.zeros(target_len)
+        count = num_heads * head_dim
+        
+        for h in range(num_heads):
+            for d in range(head_dim):
+                signal = segment[:, h, d]
+                dct_coeffs = self.dct_fast(signal)
+                power_sum += dct_coeffs ** 2
+        
+        return power_sum / count
+    
+    def analyze_segment_reduced(
+        self, 
+        kv_cache: torch.Tensor,  # [num_layers, seq_len, num_heads, head_dim]
+        start_pos: int,
+        end_pos: int
+    ) -> Optional[np.ndarray]:
+        """
+        分析单个语义片段 - 返回降维后的结果
+        
+        Returns:
+            power_curve: [target_length] 或 None（如果片段无效）
+        """
+        seq_len = kv_cache.shape[1]
+        
+        # 边界检查
+        if start_pos >= seq_len or end_pos > seq_len or start_pos >= end_pos:
+            return None
+        
+        if end_pos - start_pos < 2:
+            return None
+        
+        segment = kv_cache[:, start_pos:end_pos, :, :]
+        num_layers = segment.shape[0]
+        
+        # 累积各层的功率谱
+        layer_power_sum = np.zeros(self.target_length)
+        
+        for layer_idx in range(num_layers):
+            layer_segment = segment[layer_idx]  # [seg_len, heads, dim]
+            
+            # 重采样
+            resampled = self.resample_segment(layer_segment)
+            
+            # 归一化
+            normalized = self.normalize_segment(resampled)
+            
+            # 计算功率谱（已降维）
+            power_curve = self.compute_power_spectrum_reduced(normalized.numpy())
+            
+            layer_power_sum += power_curve
+        
+        # 对层取平均
+        return layer_power_sum / num_layers
+
+
+# ============================================================================
+# 5. 在线统计累积器
+# ============================================================================
+
+class OnlineStatistics:
+    """
+    在线统计累积器 - 使用 Welford's 算法计算均值和方差
+    无需存储所有样本，节省内存
+    """
+    
+    def __init__(self, shape: Tuple[int, ...]):
+        self.n = 0
+        self.mean = np.zeros(shape)
+        self.M2 = np.zeros(shape)  # 用于计算方差
+    
+    def update(self, x: np.ndarray):
+        """添加新样本"""
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self.M2 += delta * delta2
+    
+    def get_mean(self) -> np.ndarray:
+        """获取当前均值"""
+        return self.mean
+    
+    def get_variance(self) -> np.ndarray:
+        """获取当前方差"""
+        if self.n < 2:
+            return np.zeros_like(self.mean)
+        return self.M2 / (self.n - 1)
+    
+    def get_std(self) -> np.ndarray:
+        """获取当前标准差"""
+        return np.sqrt(self.get_variance())
+    
+    def get_count(self) -> int:
+        """获取样本数量"""
+        return self.n
+
+
+# ============================================================================
+# 6. KV Cache 提取器（内存优化版）
 # ============================================================================
 
 class KVCacheExtractor:
-    """KV Cache 提取器"""
+    """KV Cache 提取器 - 内存优化版"""
     
     def __init__(
         self, 
@@ -214,15 +311,6 @@ class KVCacheExtractor:
         torch_dtype: torch.dtype = torch.float16,
         target_layers: Optional[List[int]] = None
     ):
-        """
-        初始化模型和tokenizer
-        
-        Args:
-            model_name_or_path: 模型路径或HuggingFace模型名
-            device: 设备
-            torch_dtype: 数据类型
-            target_layers: 目标层索引列表，如果为None则自动选择中后层
-        """
         self.device = device
         self.torch_dtype = torch_dtype
         
@@ -244,320 +332,117 @@ class KVCacheExtractor:
         )
         self.model.eval()
         
-        # 获取模型配置
         self.num_layers = self.model.config.num_hidden_layers
         self.num_heads = self.model.config.num_attention_heads
         self.head_dim = self.model.config.hidden_size // self.num_heads
         
-        # 设置目标层（中后层）
         if target_layers is None:
-            # 默认选择后1/4到后1/8的层
             start_layer = int(self.num_layers * 0.75)
-            end_layer = self.num_layers
-            self.target_layers = list(range(start_layer, end_layer))
+            self.target_layers = list(range(start_layer, self.num_layers))
         else:
             self.target_layers = target_layers
         
-        print(f"Model config: {self.num_layers} layers, {self.num_heads} heads, {self.head_dim} head_dim")
-        print(f"Target layers for analysis: {self.target_layers}")
+        print(f"Model: {self.num_layers} layers, {self.num_heads} heads, {self.head_dim} head_dim")
+        print(f"Target layers: {self.target_layers}")
         
-        # 初始化语义切片器
         self.slicer = SemanticSlicer(self.tokenizer)
     
     @torch.no_grad()
-    def extract_kv_cache(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def extract_and_analyze(
+        self, 
+        text: str, 
+        freq_analyzer: FrequencyAnalyzer
+    ) -> Optional[Dict[str, Dict[str, np.ndarray]]]:
         """
-        提取单个文本的KV Cache
+        提取 KV Cache 并立即进行分析，不保存原始 KV Cache
         
         Returns:
-            input_ids: [seq_len]
-            key_cache: [num_target_layers, seq_len, num_heads, head_dim]
-            value_cache: [num_target_layers, seq_len, num_heads, head_dim]
-        """
-        # Tokenize
-        inputs = self.tokenizer(
-            text, 
-            return_tensors='pt',
-            truncation=True,
-            max_length=4096
-        ).to(self.device)
-        
-        input_ids = inputs['input_ids'][0]  # [seq_len]
-        
-        # 前向传播获取KV Cache
-        outputs = self.model(
-            **inputs,
-            output_hidden_states=False,
-            use_cache=True,
-            return_dict=True
-        )
-        
-        # 提取past_key_values
-        # past_key_values是一个tuple，每层是(key, value)
-        # key/value shape: [batch, num_heads, seq_len, head_dim]
-        past_kv = outputs.past_key_values
-        
-        key_list = []
-        value_list = []
-        
-        for layer_idx in self.target_layers:
-            key = past_kv[layer_idx][0][0]  # [num_heads, seq_len, head_dim]
-            value = past_kv[layer_idx][1][0]  # [num_heads, seq_len, head_dim]
-            
-            # 转换为 [seq_len, num_heads, head_dim]
-            key = key.permute(1, 0, 2).cpu().float()
-            value = value.permute(1, 0, 2).cpu().float()
-            
-            key_list.append(key)
-            value_list.append(value)
-        
-        # Stack: [num_target_layers, seq_len, num_heads, head_dim]
-        key_cache = torch.stack(key_list, dim=0)
-        value_cache = torch.stack(value_list, dim=0)
-        
-        return input_ids.cpu(), key_cache, value_cache
-    
-    def process_sample(self, text: str, sample_id: int) -> Optional[SampleKVData]:
-        """
-        处理单个样本：提取KV Cache并进行语义切片
+            {segment_type: {'key': power_curve, 'value': power_curve}}
+            或 None（如果处理失败）
         """
         try:
-            # 提取KV Cache
-            input_ids, key_cache, value_cache = self.extract_kv_cache(text)
+            # Tokenize
+            inputs = self.tokenizer(
+                text, 
+                return_tensors='pt',
+                truncation=True,
+                max_length=32768
+            ).to(self.device)
+            
+            input_ids = inputs['input_ids'][0]
+            
+            # 前向传播
+            outputs = self.model(
+                **inputs,
+                output_hidden_states=False,
+                use_cache=True,
+                return_dict=True
+            )
+            
+            past_kv = outputs.past_key_values
+            
+            # 只提取目标层的 KV Cache
+            key_list = []
+            value_list = []
+            
+            for layer_idx in self.target_layers:
+                key = past_kv[layer_idx][0][0].permute(1, 0, 2).cpu().float()
+                value = past_kv[layer_idx][1][0].permute(1, 0, 2).cpu().float()
+                key_list.append(key)
+                value_list.append(value)
+            
+            key_cache = torch.stack(key_list, dim=0)
+            value_cache = torch.stack(value_list, dim=0)
+            
+            # 立即释放 GPU 内存
+            del outputs, past_kv, inputs
+            torch.cuda.empty_cache()
             
             # 语义切片
-            segments = self.slicer.slice_by_special_tokens(input_ids, text)
+            segments = self.slicer.slice_by_special_tokens(input_ids.cpu(), text)
             
             if not segments:
-                print(f"Warning: Sample {sample_id} has no valid segments")
+                del key_cache, value_cache
                 return None
             
-            return SampleKVData(
-                sample_id=sample_id,
-                segments=segments,
-                key_cache=key_cache,
-                value_cache=value_cache
-            )
-        
+            # 分析每个片段
+            results = {}
+            for segment in segments:
+                seg_type = segment.segment_type
+                
+                # 分析 Key Cache
+                key_power = freq_analyzer.analyze_segment_reduced(
+                    key_cache, segment.start_pos, segment.end_pos
+                )
+                
+                # 分析 Value Cache
+                value_power = freq_analyzer.analyze_segment_reduced(
+                    value_cache, segment.start_pos, segment.end_pos
+                )
+                
+                if key_power is not None and value_power is not None:
+                    if seg_type not in results:
+                        results[seg_type] = {'key': [], 'value': []}
+                    results[seg_type]['key'].append(key_power)
+                    results[seg_type]['value'].append(value_power)
+            
+            # 释放内存
+            del key_cache, value_cache
+            
+            return results
+            
         except Exception as e:
-            print(f"Error processing sample {sample_id}: {e}")
+            print(f"Error: {e}")
+            torch.cuda.empty_cache()
             return None
 
 
 # ============================================================================
-# 5. 频域分析器
-# ============================================================================
-
-class FrequencyAnalyzer:
-    """频域分析器"""
-    
-    def __init__(self, target_length: int = 128):
-        """
-        Args:
-            target_length: 重采样的目标长度
-        """
-        self.target_length = target_length
-    
-    def dct_type2(self, x: np.ndarray) -> np.ndarray:
-        """
-        实现DCT-II变换
-        
-        对于长度为N的信号x，DCT-II定义为：
-        y_t = α_t * Σ_{n=0}^{N-1} x_n * cos[π*t*(2n+1)/(2N)]
-        
-        其中 α_t = sqrt(1/N) if t=0, else sqrt(2/N)
-        """
-        N = len(x)
-        y = np.zeros(N)
-        
-        for t in range(N):
-            # 计算归一化因子
-            if t == 0:
-                alpha = np.sqrt(1.0 / N)
-            else:
-                alpha = np.sqrt(2.0 / N)
-            
-            # 计算DCT系数
-            sum_val = 0.0
-            for n in range(N):
-                sum_val += x[n] * np.cos(np.pi * t * (2 * n + 1) / (2 * N))
-            
-            y[t] = alpha * sum_val
-        
-        return y
-    
-    def dct_fast(self, x: np.ndarray) -> np.ndarray:
-        """
-        使用FFT加速的DCT-II实现
-        """
-        from scipy.fftpack import dct
-        return dct(x, type=2, norm='ortho')
-    
-    def resample_segment(self, segment: torch.Tensor) -> torch.Tensor:
-        """
-        将变长片段重采样到固定长度
-        
-        Args:
-            segment: [seq_len, num_heads, head_dim] 或 [seq_len, hidden_dim]
-        
-        Returns:
-            resampled: [target_length, ...]
-        """
-        original_shape = segment.shape
-        seq_len = original_shape[0]
-        
-        if seq_len == self.target_length:
-            return segment
-        
-        # 重塑用于插值: [1, features, seq_len]
-        if len(original_shape) == 3:
-            # [seq_len, num_heads, head_dim] -> [num_heads * head_dim, seq_len]
-            segment_flat = segment.reshape(seq_len, -1).permute(1, 0)  # [features, seq_len]
-            features = segment_flat.shape[0]
-        else:
-            segment_flat = segment.permute(1, 0)  # [features, seq_len]
-            features = segment_flat.shape[0]
-        
-        # 添加batch维度: [1, features, seq_len]
-        segment_3d = segment_flat.unsqueeze(0).float()
-        
-        # 线性插值到目标长度
-        resampled = F.interpolate(
-            segment_3d, 
-            size=self.target_length, 
-            mode='linear', 
-            align_corners=False
-        )
-        
-        # 恢复形状: [target_length, features]
-        resampled = resampled.squeeze(0).permute(1, 0)
-        
-        if len(original_shape) == 3:
-            # 恢复为 [target_length, num_heads, head_dim]
-            num_heads = original_shape[1]
-            head_dim = original_shape[2]
-            resampled = resampled.reshape(self.target_length, num_heads, head_dim)
-        
-        return resampled
-    
-    def normalize_segment(self, segment: torch.Tensor) -> torch.Tensor:
-        """
-        Z-Score归一化
-        
-        Args:
-            segment: [target_length, num_heads, head_dim]
-        
-        Returns:
-            normalized: 同样形状
-        """
-        # 沿序列维度计算统计量
-        mean = segment.mean(dim=0, keepdim=True)
-        std = segment.std(dim=0, keepdim=True) + 1e-8
-        
-        normalized = (segment - mean) / std
-        return normalized
-    
-    def compute_power_spectrum(self, segment: np.ndarray) -> np.ndarray:
-        """
-        计算功率谱
-        
-        Args:
-            segment: [target_length, num_heads, head_dim]
-        
-        Returns:
-            power_spectrum: [target_length, num_heads, head_dim]
-        """
-        # 对序列维度（第一维）进行DCT
-        # 需要对每个(head, dim)位置分别计算
-        target_len, num_heads, head_dim = segment.shape
-        power_spectrum = np.zeros_like(segment)
-        
-        for h in range(num_heads):
-            for d in range(head_dim):
-                signal = segment[:, h, d]
-                dct_coeffs = self.dct_fast(signal)
-                power_spectrum[:, h, d] = dct_coeffs ** 2
-        
-        return power_spectrum
-    
-    def analyze_segment(
-        self, 
-        kv_cache: torch.Tensor,  # [num_layers, seq_len, num_heads, head_dim]
-        start_pos: int,
-        end_pos: int,
-        use_key: bool = True
-    ) -> np.ndarray:
-        """
-        分析单个语义片段
-        
-        Returns:
-            power_spectrum: [target_length, num_layers, num_heads, head_dim]
-        """
-        # 切片
-        if use_key:
-            segment = kv_cache[:, start_pos:end_pos, :, :]  # [num_layers, seg_len, heads, dim]
-        else:
-            segment = kv_cache[:, start_pos:end_pos, :, :]
-        
-        num_layers = segment.shape[0]
-        
-        all_spectra = []
-        
-        for layer_idx in range(num_layers):
-            layer_segment = segment[layer_idx]  # [seg_len, heads, dim]
-            
-            # 重采样
-            resampled = self.resample_segment(layer_segment)  # [target_len, heads, dim]
-            
-            # 归一化
-            normalized = self.normalize_segment(resampled)  # [target_len, heads, dim]
-            
-            # 计算功率谱
-            power = self.compute_power_spectrum(normalized.numpy())  # [target_len, heads, dim]
-            
-            all_spectra.append(power)
-        
-        # Stack: [num_layers, target_len, heads, dim]
-        stacked = np.stack(all_spectra, axis=0)
-        
-        # 转置为 [target_len, num_layers, heads, dim]
-        return np.transpose(stacked, (1, 0, 2, 3))
-    
-    def aggregate_spectra(
-        self, 
-        spectra_list: List[np.ndarray]
-    ) -> np.ndarray:
-        """
-        聚合多个样本的频谱
-        
-        Args:
-            spectra_list: List of [target_length, num_layers, num_heads, head_dim]
-        
-        Returns:
-            mean_spectrum: [target_length]  (全部维度平均后的曲线)
-        """
-        if not spectra_list:
-            return np.zeros(self.target_length)
-        
-        # Stack所有样本
-        stacked = np.stack(spectra_list, axis=0)  # [num_samples, target_len, layers, heads, dim]
-        
-        # 逐步平均
-        # 先对所有样本平均
-        mean_over_samples = stacked.mean(axis=0)  # [target_len, layers, heads, dim]
-        
-        # 再对所有其他维度平均，得到一条曲线
-        mean_curve = mean_over_samples.mean(axis=(1, 2, 3))  # [target_len]
-        
-        return mean_curve
-
-
-# ============================================================================
-# 6. 主分析流程
+# 7. 主分析流程（内存优化版）
 # ============================================================================
 
 class KVFrequencyAnalysisPipeline:
-    """完整的分析流水线"""
+    """完整的分析流水线 - 内存优化版"""
     
     def __init__(
         self,
@@ -565,12 +450,17 @@ class KVFrequencyAnalysisPipeline:
         json_path: str,
         target_length: int = 128,
         device: str = 'cuda',
-        target_layers: Optional[List[int]] = None
+        target_layers: Optional[List[int]] = None,
+        checkpoint_interval: int = 100,
+        checkpoint_dir: str = './checkpoints'
     ):
         self.json_path = json_path
         self.target_length = target_length
+        self.checkpoint_interval = checkpoint_interval
+        self.checkpoint_dir = checkpoint_dir
         
-        # 初始化组件
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
         print("Initializing data loader...")
         self.data_loader = DataLoader(json_path)
         
@@ -584,83 +474,154 @@ class KVFrequencyAnalysisPipeline:
         print("Initializing frequency analyzer...")
         self.freq_analyzer = FrequencyAnalyzer(target_length=target_length)
         
-        # 存储结果
-        self.results = {
-            'think': {'key': [], 'value': []},
-            'tool_call': {'key': [], 'value': []},
-            'tool_response': {'key': [], 'value': []},
-            'answer': {'key': [], 'value': []}
+        # 使用在线统计累积器替代列表存储
+        self.stats = {
+            'think': {'key': OnlineStatistics((target_length,)), 
+                     'value': OnlineStatistics((target_length,))},
+            'tool_call': {'key': OnlineStatistics((target_length,)), 
+                         'value': OnlineStatistics((target_length,))},
+            'tool_response': {'key': OnlineStatistics((target_length,)), 
+                             'value': OnlineStatistics((target_length,))},
         }
+        
+        self.processed_count = 0
+        self.segment_counts = {k: 0 for k in self.stats.keys()}
     
-    def run(self, max_samples: Optional[int] = None) -> Dict:
-        """
-        运行完整分析流程
-        """
-        # 获取所有assistant内容
+    def run(
+        self, 
+        max_samples: Optional[int] = None,
+        resume_from: Optional[int] = None
+    ) -> Dict:
+        """运行分析"""
         assistant_contents = self.data_loader.extract_assistant_contents()
         
         if max_samples:
             assistant_contents = assistant_contents[:max_samples]
         
-        print(f"\nProcessing {len(assistant_contents)} samples...")
+        start_idx = resume_from if resume_from else 0
         
-        for idx, text in enumerate(tqdm(assistant_contents, desc="Processing samples")):
+        print(f"\nProcessing {len(assistant_contents)} samples (starting from {start_idx})...")
+        
+        for idx in tqdm(range(start_idx, len(assistant_contents)), desc="Processing"):
+            text = assistant_contents[idx]
+            
             if not text.strip():
                 continue
             
-            # 提取KV Cache
-            sample_data = self.kv_extractor.process_sample(text, idx)
+            # 提取并分析
+            results = self.kv_extractor.extract_and_analyze(text, self.freq_analyzer)
             
-            if sample_data is None:
+            if results is None:
                 continue
             
-            # 对每个语义片段进行频域分析
-            for segment in sample_data.segments:
-                seg_type = segment.segment_type
-                
-                if seg_type not in self.results:
+            # 更新在线统计
+            for seg_type, cache_data in results.items():
+                if seg_type not in self.stats:
                     continue
                 
-                # 分析Key Cache
-                key_spectrum = self.freq_analyzer.analyze_segment(
-                    sample_data.key_cache,
-                    segment.start_pos,
-                    segment.end_pos,
-                    use_key=True
-                )
-                self.results[seg_type]['key'].append(key_spectrum)
-                
-                # 分析Value Cache
-                value_spectrum = self.freq_analyzer.analyze_segment(
-                    sample_data.value_cache,
-                    segment.start_pos,
-                    segment.end_pos,
-                    use_key=False
-                )
-                self.results[seg_type]['value'].append(value_spectrum)
+                for cache_type in ['key', 'value']:
+                    for power_curve in cache_data.get(cache_type, []):
+                        self.stats[seg_type][cache_type].update(power_curve)
+                        if cache_type == 'key':
+                            self.segment_counts[seg_type] += 1
+            
+            self.processed_count += 1
+            
+            # 定期保存 checkpoint
+            if self.processed_count % self.checkpoint_interval == 0:
+                self._save_checkpoint(idx)
+                gc.collect()
+                torch.cuda.empty_cache()
         
-        # 聚合结果
-        aggregated = self._aggregate_results()
+        # 最终保存
+        self._save_checkpoint(len(assistant_contents) - 1, final=True)
         
-        return aggregated
+        return self._get_aggregated_results()
     
-    def _aggregate_results(self) -> Dict:
-        """聚合所有结果"""
+    def _save_checkpoint(self, current_idx: int, final: bool = False):
+        """保存检查点"""
+        checkpoint = {
+            'current_idx': current_idx,
+            'processed_count': self.processed_count,
+            'segment_counts': self.segment_counts,
+            'stats': {}
+        }
+        
+        for seg_type, cache_stats in self.stats.items():
+            checkpoint['stats'][seg_type] = {}
+            for cache_type, online_stat in cache_stats.items():
+                checkpoint['stats'][seg_type][cache_type] = {
+                    'n': online_stat.n,
+                    'mean': online_stat.mean,
+                    'M2': online_stat.M2
+                }
+        
+        suffix = 'final' if final else f'idx_{current_idx}'
+        checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_{suffix}.npz')
+        
+        # 使用 numpy 保存
+        save_dict = {
+            'current_idx': current_idx,
+            'processed_count': self.processed_count,
+        }
+        
+        for seg_type in self.stats:
+            for cache_type in ['key', 'value']:
+                prefix = f'{seg_type}_{cache_type}'
+                stat = self.stats[seg_type][cache_type]
+                save_dict[f'{prefix}_n'] = stat.n
+                save_dict[f'{prefix}_mean'] = stat.mean
+                save_dict[f'{prefix}_M2'] = stat.M2
+        
+        for seg_type, count in self.segment_counts.items():
+            save_dict[f'count_{seg_type}'] = count
+        
+        np.savez(checkpoint_path, **save_dict)
+        print(f"\nCheckpoint saved: {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_path: str) -> int:
+        """加载检查点，返回恢复的索引"""
+        data = np.load(checkpoint_path)
+        
+        self.processed_count = int(data['processed_count'])
+        current_idx = int(data['current_idx'])
+        
+        for seg_type in self.stats:
+            for cache_type in ['key', 'value']:
+                prefix = f'{seg_type}_{cache_type}'
+                self.stats[seg_type][cache_type].n = int(data[f'{prefix}_n'])
+                self.stats[seg_type][cache_type].mean = data[f'{prefix}_mean']
+                self.stats[seg_type][cache_type].M2 = data[f'{prefix}_M2']
+        
+        for seg_type in self.segment_counts:
+            self.segment_counts[seg_type] = int(data[f'count_{seg_type}'])
+        
+        print(f"Loaded checkpoint from index {current_idx}")
+        print(f"Processed samples: {self.processed_count}")
+        print(f"Segment counts: {self.segment_counts}")
+        
+        return current_idx + 1
+    
+    def _get_aggregated_results(self) -> Dict:
+        """获取聚合结果"""
         aggregated = {}
         
-        for seg_type in self.results:
+        print("\n" + "=" * 50)
+        print("Final Statistics:")
+        print("=" * 50)
+        
+        for seg_type in self.stats:
             aggregated[seg_type] = {}
             
             for cache_type in ['key', 'value']:
-                spectra_list = self.results[seg_type][cache_type]
+                stat = self.stats[seg_type][cache_type]
                 
-                if spectra_list:
-                    mean_curve = self.freq_analyzer.aggregate_spectra(spectra_list)
-                    aggregated[seg_type][cache_type] = mean_curve
-                    print(f"{seg_type} - {cache_type}: {len(spectra_list)} samples aggregated")
+                if stat.n > 0:
+                    aggregated[seg_type][cache_type] = stat.get_mean()
+                    print(f"{seg_type} - {cache_type}: {stat.n} samples")
                 else:
                     aggregated[seg_type][cache_type] = np.zeros(self.target_length)
-                    print(f"{seg_type} - {cache_type}: No samples found")
+                    print(f"{seg_type} - {cache_type}: No samples")
         
         return aggregated
     
@@ -670,16 +631,13 @@ class KVFrequencyAnalysisPipeline:
         save_path: Optional[str] = None,
         show_plot: bool = True
     ):
-        """
-        可视化分析结果
-        """
+        """可视化结果"""
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         
         colors = {
             'think': '#4a90e2',
             'tool_call': '#50c878',
             'tool_response': '#ff6b6b',
-            'answer': '#9b59b6'
         }
         
         freq_axis = np.arange(self.target_length)
@@ -710,7 +668,7 @@ class KVFrequencyAnalysisPipeline:
         ax2.grid(True, alpha=0.3)
         ax2.set_yscale('log')
         
-        # 左下：低频区域放大 (0-20)
+        # 左下：低频区域
         ax3 = axes[1, 0]
         low_freq_end = min(20, self.target_length)
         for seg_type, color in colors.items():
@@ -720,23 +678,40 @@ class KVFrequencyAnalysisPipeline:
                         label=f'<{seg_type}>', color=color, linewidth=2, marker='o', markersize=4)
         ax3.set_xlabel('Frequency Index')
         ax3.set_ylabel('Power Spectral Density')
-        ax3.set_title('Key Cache - Low Frequency Region (0-20)')
+        ax3.set_title('Key Cache - Low Frequency (0-20)')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         
-        # 右下：高频区域放大
+        # 右下：频段能量对比
         ax4 = axes[1, 1]
-        high_freq_start = max(0, self.target_length - 30)
-        for seg_type, color in colors.items():
-            if seg_type in aggregated and np.any(aggregated[seg_type]['key']):
-                ax4.plot(freq_axis[high_freq_start:], 
-                        aggregated[seg_type]['key'][high_freq_start:],
-                        label=f'<{seg_type}>', color=color, linewidth=2, marker='o', markersize=4)
-        ax4.set_xlabel('Frequency Index')
-        ax4.set_ylabel('Power Spectral Density')
-        ax4.set_title(f'Key Cache - High Frequency Region ({high_freq_start}-{self.target_length})')
+        bands = {
+            'DC': (0, 1),
+            'VLow': (1, 5),
+            'Low': (5, 20),
+            'Mid': (20, 50),
+            'High': (50, self.target_length)
+        }
+        
+        x = np.arange(len(bands))
+        width = 0.2
+        
+        for i, (seg_type, color) in enumerate(colors.items()):
+            if seg_type in aggregated:
+                spectrum = aggregated[seg_type]['key']
+                total = np.sum(spectrum) + 1e-10
+                ratios = []
+                for band_name, (start, end) in bands.items():
+                    end = min(end, len(spectrum))
+                    ratios.append(np.sum(spectrum[start:end]) / total)
+                ax4.bar(x + i*width, ratios, width, label=f'<{seg_type}>', color=color)
+        
+        ax4.set_xlabel('Frequency Band')
+        ax4.set_ylabel('Energy Ratio')
+        ax4.set_title('Key Cache - Band Energy Distribution')
+        ax4.set_xticks(x + width * 1.5)
+        ax4.set_xticklabels(list(bands.keys()))
         ax4.legend()
-        ax4.grid(True, alpha=0.3)
+        ax4.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
         
@@ -750,10 +725,7 @@ class KVFrequencyAnalysisPipeline:
         return fig
     
     def compute_frequency_band_energy(self, aggregated: Dict) -> Dict:
-        """
-        计算各频段能量分布
-        """
-        # 定义频段
+        """计算频段能量"""
         bands = {
             'DC': (0, 1),
             'Very Low': (1, 5),
@@ -789,260 +761,132 @@ class KVFrequencyAnalysisPipeline:
         return band_energy
     
     def generate_report(self, aggregated: Dict, band_energy: Dict) -> str:
-        """
-        生成分析报告
-        """
+        """生成报告"""
         report = []
         report.append("=" * 60)
         report.append("KV Cache 频域分析报告")
         report.append("=" * 60)
         report.append("")
         
-        for seg_type in ['think', 'tool_call', 'tool_response', 'answer']:
+        report.append("### 数据统计")
+        report.append("-" * 40)
+        report.append(f"总处理样本数: {self.processed_count}")
+        for seg_type, count in self.segment_counts.items():
+            report.append(f"  {seg_type}: {count} 个片段")
+        
+        for seg_type in ['think', 'tool_call', 'tool_response']:
             if seg_type not in aggregated:
                 continue
             
             report.append(f"\n### <{seg_type}> 片段分析")
             report.append("-" * 40)
             
-            # Key Cache 分析
             if seg_type in band_energy and 'key' in band_energy[seg_type]:
                 report.append("\n**Key Cache 频段能量分布:**")
                 for band_name, data in band_energy[seg_type]['key'].items():
                     report.append(f"  {band_name:12s}: {data['ratio']*100:6.2f}%")
             
-            # Value Cache 分析
             if seg_type in band_energy and 'value' in band_energy[seg_type]:
                 report.append("\n**Value Cache 频段能量分布:**")
                 for band_name, data in band_energy[seg_type]['value'].items():
                     report.append(f"  {band_name:12s}: {data['ratio']*100:6.2f}%")
         
-        report.append("\n" + "=" * 60)
-        report.append("分析结论")
-        report.append("=" * 60)
-        
-        # 自动生成一些观察结论
-        report.append("""
-1. **思维链 (<think>) 特征**: 
-   - 观察低频能量占比，高占比表示连贯的语义推理
-   
-2. **工具调用 (<tool_call>) 特征**:
-   - 观察是否存在特定频段的能量峰值，表示结构化语法模式
-   
-3. **工具响应 (<tool_response>) 特征**:
-   - 对比与自然语言的相似度，高频噪声可能表示数据密集型内容
-""")
-        
         return "\n".join(report)
 
 
 # ============================================================================
-# 7. 使用示例与主函数
-# ============================================================================
-
-def main():
-    """主函数示例"""
-    
-    # 配置参数
-    config = {
-        'model_name_or_path': 'meta-llama/Llama-3.2-3B-Instruct',  # 替换为你的模型
-        'json_path': 'agent_conversations.json',  # 替换为你的数据路径
-        'target_length': 128,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'target_layers': None,  # None表示自动选择中后层
-        'max_samples': 100,  # 处理的最大样本数
-    }
-    
-    print("=" * 60)
-    print("KV Cache 频域分析实验")
-    print("=" * 60)
-    print(f"\nConfiguration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    print()
-    
-    # 创建流水线
-    pipeline = KVFrequencyAnalysisPipeline(
-        model_name_or_path=config['model_name_or_path'],
-        json_path=config['json_path'],
-        target_length=config['target_length'],
-        device=config['device'],
-        target_layers=config['target_layers']
-    )
-    
-    # 运行分析
-    aggregated = pipeline.run(max_samples=config['max_samples'])
-    
-    # 计算频段能量
-    band_energy = pipeline.compute_frequency_band_energy(aggregated)
-    
-    # 生成报告
-    report = pipeline.generate_report(aggregated, band_energy)
-    print(report)
-    
-    # 保存报告
-    with open('frequency_analysis_report.txt', 'w') as f:
-        f.write(report)
-    
-    # 可视化
-    pipeline.plot_results(aggregated, save_path='frequency_analysis.png')
-    
-    # 保存原始数据
-    np.savez('frequency_analysis_data.npz', 
-             **{f"{k}_{t}": v[t] for k, v in aggregated.items() for t in ['key', 'value']})
-    
-    print("\nAnalysis complete!")
-    print("Outputs:")
-    print("  - frequency_analysis_report.txt")
-    print("  - frequency_analysis.png")
-    print("  - frequency_analysis_data.npz")
-
-
-# ============================================================================
-# 8. 测试用的模拟数据生成器
+# 8. 测试数据生成
 # ============================================================================
 
 def create_test_data(output_path: str = 'test_agent_data.json', num_samples: int = 10):
-    """
-    创建测试用的模拟数据
-    """
+    """创建测试数据"""
     samples = []
     
     for i in range(num_samples):
         sample = {
             "id": i,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant with access to tools."
-                },
-                {
-                    "role": "user",
-                    "content": f"What is the weather in city {i}?"
-                },
-                {
-                    "role": "assistant",
-                    "content": f"<think>Let me think about this request. The user wants to know the weather in city {i}. I should use the weather API to get this information.</think><tool_call>{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"city_{i}\"}}}}</tool_call>"
-                },
-                {
-                    "role": "assistant",
-                    "content": f"<tool_response>{{\"temperature\": {20 + i}, \"condition\": \"sunny\", \"humidity\": {50 + i}}}</tool_response>"
-                },
-                {
-                    "role": "assistant",
-                    "content": f"<think>I have received the weather information. The temperature is {20 + i} degrees and it's sunny.</think><answer>The weather in city {i} is sunny with a temperature of {20 + i}°C and humidity of {50 + i}%.</answer>"
-                }
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"What is the weather in city {i}?"},
+                {"role": "assistant", "content": f"<think>The user wants weather info for city {i}. Let me use the weather API.</think><tool_call>{{\"name\": \"get_weather\", \"city\": \"city_{i}\"}}</tool_call>"},
+                {"role": "assistant", "content": f"<tool_response>{{\"temp\": {20+i}, \"condition\": \"sunny\"}}</tool_response>"},
+                {"role": "assistant", "content": f"<think>Got the weather data.</think><answer>Weather in city {i}: {20+i}°C and sunny.</answer>"}
             ]
         }
         samples.append(sample)
     
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(samples, f, indent=2, ensure_ascii=False)
+        json.dump(samples, f, indent=2)
     
     print(f"Test data saved to {output_path}")
-    return output_path
 
 
 # ============================================================================
-# 9. 独立的分析函数（不需要GPU时使用）
+# 9. 主函数
 # ============================================================================
 
-def analyze_precomputed_kv_cache(
-    kv_cache_path: str,
-    segments_info_path: str,
-    target_length: int = 128
-):
-    """
-    分析预先提取的KV Cache数据
-    用于已经有KV Cache保存的情况
-    """
-    # 加载预计算的数据
-    kv_data = np.load(kv_cache_path)
-    with open(segments_info_path, 'r') as f:
-        segments_info = json.load(f)
-    
-    analyzer = FrequencyAnalyzer(target_length=target_length)
-    
-    results = {
-        'think': [],
-        'tool_call': [],
-        'tool_response': [],
-        'answer': []
-    }
-    
-    for sample_info in segments_info:
-        sample_id = sample_info['sample_id']
-        key_cache = kv_data[f'key_{sample_id}']
-        
-        for seg in sample_info['segments']:
-            seg_type = seg['type']
-            start = seg['start']
-            end = seg['end']
-            
-            spectrum = analyzer.analyze_segment(
-                torch.tensor(key_cache),
-                start, end,
-                use_key=True
-            )
-            
-            if seg_type in results:
-                results[seg_type].append(spectrum)
-    
-    # 聚合
-    aggregated = {}
-    for seg_type, spectra_list in results.items():
-        if spectra_list:
-            aggregated[seg_type] = analyzer.aggregate_spectra(spectra_list)
-        else:
-            aggregated[seg_type] = np.zeros(target_length)
-    
-    return aggregated
-
-
-if __name__ == '__main__':
+def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='KV Cache Frequency Analysis')
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-3B-Instruct',
-                        help='Model name or path')
-    parser.add_argument('--data', type=str, default='agent_conversations.json',
-                        help='Path to JSON data file')
-    parser.add_argument('--target_length', type=int, default=128,
-                        help='Target length for resampling')
-    parser.add_argument('--max_samples', type=int, default=None,
-                        help='Maximum number of samples to process')
-    parser.add_argument('--create_test_data', action='store_true',
-                        help='Create test data file')
-    parser.add_argument('--output_dir', type=str, default='.',
-                        help='Output directory')
+    parser = argparse.ArgumentParser(description='KV Cache Frequency Analysis (Memory Optimized)')
+    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-3B-Instruct')
+    parser.add_argument('--data', type=str, default='agent_conversations.json')
+    parser.add_argument('--target_length', type=int, default=128)
+    parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument('--checkpoint_interval', type=int, default=100)
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--create_test_data', action='store_true')
+    parser.add_argument('--output_dir', type=str, default='.')
     
     args = parser.parse_args()
     
     if args.create_test_data:
         create_test_data(args.data)
-    else:
-        # 检查数据文件是否存在
-        import os
-        if not os.path.exists(args.data):
-            print(f"Data file {args.data} not found. Creating test data...")
-            create_test_data(args.data)
-        
-        # 运行主分析
-        pipeline = KVFrequencyAnalysisPipeline(
-            model_name_or_path=args.model,
-            json_path=args.data,
-            target_length=args.target_length,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
-        )
-        
-        aggregated = pipeline.run(max_samples=args.max_samples)
-        band_energy = pipeline.compute_frequency_band_energy(aggregated)
-        report = pipeline.generate_report(aggregated, band_energy)
-        
-        print(report)
-        
-        output_prefix = os.path.join(args.output_dir, 'frequency_analysis')
-        pipeline.plot_results(aggregated, save_path=f'{output_prefix}.png')
-        
-        with open(f'{output_prefix}_report.txt', 'w') as f:
-            f.write(report)
+        return
+    
+    if not os.path.exists(args.data):
+        print(f"Data file not found. Creating test data...")
+        create_test_data(args.data)
+    
+    # 创建流水线
+    pipeline = KVFrequencyAnalysisPipeline(
+        model_name_or_path=args.model,
+        json_path=args.data,
+        target_length=args.target_length,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        checkpoint_interval=args.checkpoint_interval,
+        checkpoint_dir=args.checkpoint_dir
+    )
+    
+    # 恢复检查点
+    resume_from = None
+    if args.resume and os.path.exists(args.resume):
+        resume_from = pipeline.load_checkpoint(args.resume)
+    
+    # 运行分析
+    aggregated = pipeline.run(max_samples=args.max_samples, resume_from=resume_from)
+    
+    # 生成报告
+    band_energy = pipeline.compute_frequency_band_energy(aggregated)
+    report = pipeline.generate_report(aggregated, band_energy)
+    print(report)
+    
+    # 保存结果
+    output_prefix = os.path.join(args.output_dir, 'frequency_analysis')
+    
+    with open(f'{output_prefix}_report.txt', 'w') as f:
+        f.write(report)
+    
+    pipeline.plot_results(aggregated, save_path=f'{output_prefix}.png')
+    
+    # 保存数据
+    save_dict = {f"{k}_{t}": v[t] for k, v in aggregated.items() for t in ['key', 'value']}
+    np.savez(f'{output_prefix}_data.npz', **save_dict)
+    
+    print(f"\nAnalysis complete!")
+    print(f"Outputs saved to {args.output_dir}/")
+
+
+if __name__ == '__main__':
+    main()
