@@ -8,17 +8,17 @@ KV Cache 频域分析报告
 
 **Key Cache 频段能量分布:**
   DC          :   0.00%
-  Very Low    :  45.06%
-  Low         :  46.59%
-  Mid         :   8.18%
-  High        :   0.14%
+  Very Low    :  44.32%
+  Low         :  47.20%
+  Mid         :   8.29%
+  High        :   0.15%
   Very High   :   0.03%
 
 **Value Cache 频段能量分布:**
   DC          :   0.00%
-  Very Low    :  36.54%
-  Low         :  53.29%
-  Mid         :   9.96%
+  Very Low    :  35.79%
+  Low         :  53.93%
+  Mid         :  10.07%
   High        :   0.17%
   Very High   :   0.04%
 
@@ -27,22 +27,38 @@ KV Cache 频域分析报告
 
 **Key Cache 频段能量分布:**
   DC          :   0.00%
-  Very Low    :  35.68%
-  Low         :  43.87%
-  Mid         :  19.38%
-  High        :   0.93%
+  Very Low    :  35.50%
+  Low         :  43.92%
+  Mid         :  19.51%
+  High        :   0.94%
   Very High   :   0.14%
 
 **Value Cache 频段能量分布:**
   DC          :   0.00%
-  Very Low    :  24.08%
-  Low         :  48.64%
-  Mid         :  25.87%
-  High        :   1.23%
+  Very Low    :  23.93%
+  Low         :  48.66%
+  Mid         :  25.98%
+  High        :   1.24%
   Very High   :   0.19%
 
 ### <tool_response> 片段分析
 ----------------------------------------
+
+**Key Cache 频段能量分布:**
+  DC          :   0.00%
+  Very Low    :  40.52%
+  Low         :  47.10%
+  Mid         :  12.14%
+  High        :   0.18%
+  Very High   :   0.05%
+
+**Value Cache 频段能量分布:**
+  DC          :   0.00%
+  Very Low    :  30.00%
+  Low         :  52.37%
+  Mid         :  17.32%
+  High        :   0.24%
+  Very High   :   0.08%
 
 ### <answer> 片段分析
 ----------------------------------------

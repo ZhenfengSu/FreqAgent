@@ -1,6 +1,10 @@
 # 使用默认配置
 # python kv_frequency_analysis.py --model your_model_path --data your_data.json
 
+# 先检查数据
+# python kv_frequency_analysis.py --data trajectories.json --debug
+
+
 MODEL_PATH="/mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B"
 # 指定参数
 python kv_frequency_analysis.py \
