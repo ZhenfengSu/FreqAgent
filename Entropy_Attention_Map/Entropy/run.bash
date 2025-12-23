@@ -6,7 +6,6 @@ python attention_analysis.py \
     --data_path trajectories.json  \
     --output_dir ./results \
     --max_samples 100
-    --device_map auto
 
 
 # python attention_analysis.py \
