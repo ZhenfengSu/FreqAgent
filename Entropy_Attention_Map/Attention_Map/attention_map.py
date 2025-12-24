@@ -1,6 +1,7 @@
 """
 Attention Map Analyzer for Large Language Models
 支持 32B 模型多卡运行，分析 <think>, <tool_call>, <tool_response> 等标签块的注意力分布
+使用 register_hook 方式只提取指定层的 attention，节省显存
 """
 
 import json
@@ -9,11 +10,13 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from collections import defaultdict
 import warnings
+import gc
+
 warnings.filterwarnings('ignore')
 
 
@@ -39,8 +42,166 @@ class AttentionAnalysisResult:
     cross_region_attention: Dict[str, Dict[str, float]]
 
 
+class AttentionHook:
+    """用于捕获指定层 attention 的 Hook 类"""
+    
+    def __init__(self, layer_idx: int):
+        self.layer_idx = layer_idx
+        self.attention = None
+        self.handle = None
+    
+    def hook_fn(self, module, input, output):
+        """Hook 函数，捕获 attention weights"""
+        # 不同模型架构的输出格式可能不同
+        # 通常 attention 模块的输出是 (hidden_states, attention_weights, ...)
+        # 或者是一个包含 attention_weights 的 tuple/namedtuple
+        
+        if isinstance(output, tuple):
+            # 尝试找到 attention weights
+            for item in output:
+                if isinstance(item, torch.Tensor) and item.dim() == 4:
+                    # Shape: (batch, num_heads, seq_len, seq_len)
+                    # 检查是否是方阵（attention weights 特征）
+                    if item.shape[-1] == item.shape[-2]:
+                        # 平均所有头，转换为 CPU numpy，立即释放 GPU 内存
+                        self.attention = item.mean(dim=1).detach().float().cpu().numpy()
+                        return
+        elif hasattr(output, 'attentions') and output.attentions is not None:
+            attn = output.attentions
+            self.attention = attn.mean(dim=1).detach().float().cpu().numpy()
+    
+    def register(self, module):
+        """注册 hook"""
+        self.handle = module.register_forward_hook(self.hook_fn)
+    
+    def remove(self):
+        """移除 hook"""
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+    
+    def clear(self):
+        """清理捕获的 attention"""
+        self.attention = None
+
+
+class SelfAttentionHook:
+    """专门用于捕获 self-attention 输出的 Hook"""
+    
+    def __init__(self, layer_idx: int):
+        self.layer_idx = layer_idx
+        self.attention = None
+        self.handle = None
+    
+    def hook_fn(self, module, args, kwargs, output):
+        """Hook 函数 - 使用 forward hook with kwargs"""
+        # 处理不同的输出格式
+        if isinstance(output, tuple) and len(output) >= 2:
+            # 通常第二个元素是 attention weights
+            attn_weights = output[1]
+            if attn_weights is not None and isinstance(attn_weights, torch.Tensor):
+                if attn_weights.dim() == 4:  # (batch, heads, seq, seq)
+                    self.attention = attn_weights.mean(dim=1).detach().float().cpu().numpy()
+    
+    def register(self, module):
+        """注册 hook"""
+        self.handle = module.register_forward_hook(
+            self.hook_fn, 
+            with_kwargs=True
+        )
+    
+    def remove(self):
+        """移除 hook"""
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+    
+    def clear(self):
+        """清理"""
+        self.attention = None
+
+
+class AttentionCaptureContext:
+    """上下文管理器，用于安全地注册和移除 hooks"""
+    
+    def __init__(self, model, layer_indices: List[int]):
+        self.model = model
+        self.layer_indices = layer_indices
+        self.hooks: Dict[int, Any] = {}
+        self.attention_modules = self._find_attention_modules()
+    
+    def _find_attention_modules(self) -> Dict[int, torch.nn.Module]:
+        """找到模型中的 attention 模块"""
+        attention_modules = {}
+        
+        # 尝试不同的模型架构
+        # Qwen2, LLaMA, Mistral 等常见架构
+        
+        if hasattr(self.model, 'model'):
+            base_model = self.model.model
+        else:
+            base_model = self.model
+        
+        # 查找 layers
+        layers = None
+        for attr in ['layers', 'decoder_layers', 'h', 'blocks']:
+            if hasattr(base_model, attr):
+                layers = getattr(base_model, attr)
+                break
+        
+        if layers is None:
+            raise ValueError("Cannot find transformer layers in model")
+        
+        # 查找每层的 attention 模块
+        for idx in self.layer_indices:
+            if idx >= len(layers):
+                print(f"Warning: Layer {idx} does not exist (model has {len(layers)} layers)")
+                continue
+            
+            layer = layers[idx]
+            
+            # 尝试找到 self-attention 模块
+            attn_module = None
+            for attr in ['self_attn', 'attention', 'attn', 'self_attention']:
+                if hasattr(layer, attr):
+                    attn_module = getattr(layer, attr)
+                    break
+            
+            if attn_module is not None:
+                attention_modules[idx] = attn_module
+            else:
+                print(f"Warning: Cannot find attention module in layer {idx}")
+        
+        return attention_modules
+    
+    def __enter__(self):
+        """注册 hooks"""
+        for layer_idx, module in self.attention_modules.items():
+            hook = SelfAttentionHook(layer_idx)
+            hook.register(module)
+            self.hooks[layer_idx] = hook
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """移除 hooks 并清理"""
+        for hook in self.hooks.values():
+            hook.remove()
+            hook.clear()
+        self.hooks.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    def get_attentions(self) -> Dict[int, np.ndarray]:
+        """获取捕获的 attention maps"""
+        result = {}
+        for layer_idx, hook in self.hooks.items():
+            if hook.attention is not None:
+                result[layer_idx] = hook.attention[0]  # 取 batch 的第一个
+        return result
+
+
 class AttentionMapAnalyzer:
-    """注意力图分析器"""
+    """注意力图分析器 - 使用 Hook 方式提取 attention"""
     
     # 需要提取的标签模式
     TAG_PATTERNS = {
@@ -50,10 +211,14 @@ class AttentionMapAnalyzer:
         'answer': r'<answer>(.*?)</answer>'
     }
     
+    # 默认分析 4 层
+    DEFAULT_NUM_LAYERS = 4
+    
     def __init__(
         self,
         model_path: str,
         selected_layers: List[int] = None,
+        num_analysis_layers: int = 4,
         device_map: str = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
         max_length: int = 4096
@@ -63,7 +228,8 @@ class AttentionMapAnalyzer:
         
         Args:
             model_path: 模型路径
-            selected_layers: 要分析的层索引列表，默认选择几个代表性层
+            selected_layers: 要分析的层索引列表（如果指定，则忽略 num_analysis_layers）
+            num_analysis_layers: 要分析的层数（默认4层，均匀分布）
             device_map: 设备映射策略，支持多卡
             torch_dtype: 模型精度
             max_length: 最大序列长度
@@ -79,39 +245,60 @@ class AttentionMapAnalyzer:
         )
         
         print(f"Loading model with device_map='{device_map}'...")
+        # 注意：不需要 output_attentions=True，我们使用 hook
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map=device_map,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            output_attentions=True,  # 启用注意力输出
-            attn_implementation="eager"  # 使用eager模式以获取完整attention
+            attn_implementation="eager"  # 使用 eager 模式以获取完整 attention
         )
         self.model.eval()
         
         # 获取模型层数
-        self.num_layers = self.model.config.num_hidden_layers
+        self.num_layers = self._get_num_layers()
         print(f"Model has {self.num_layers} layers")
         
-        # 设置要分析的层（默认选择早期、中期、晚期各几层）
-        if selected_layers is None:
-            self.selected_layers = self._get_default_layers()
-        else:
+        # 设置要分析的层（默认选择 4 层，均匀分布）
+        if selected_layers is not None:
             self.selected_layers = selected_layers
+        else:
+            self.selected_layers = self._get_uniform_layers(num_analysis_layers)
+        
         print(f"Selected layers for analysis: {self.selected_layers}")
     
-    def _get_default_layers(self) -> List[int]:
-        """获取默认的代表性层"""
+    def _get_num_layers(self) -> int:
+        """获取模型层数"""
+        if hasattr(self.model.config, 'num_hidden_layers'):
+            return self.model.config.num_hidden_layers
+        elif hasattr(self.model.config, 'n_layer'):
+            return self.model.config.n_layer
+        else:
+            # 尝试从模型结构获取
+            if hasattr(self.model, 'model'):
+                base_model = self.model.model
+            else:
+                base_model = self.model
+            
+            for attr in ['layers', 'decoder_layers', 'h', 'blocks']:
+                if hasattr(base_model, attr):
+                    return len(getattr(base_model, attr))
+            
+            raise ValueError("Cannot determine number of layers")
+    
+    def _get_uniform_layers(self, num_layers: int = 4) -> List[int]:
+        """获取均匀分布的层索引"""
         n = self.num_layers
-        # 选择第1层、1/4处、1/2处、3/4处、最后一层
-        layers = [
-            0,              # 第一层
-            n // 4,         # 1/4 处
-            n // 2,         # 中间层
-            3 * n // 4,     # 3/4 处
-            n - 1           # 最后一层
-        ]
-        return sorted(set(layers))
+        if num_layers >= n:
+            return list(range(n))
+        
+        # 均匀分布：包含第一层和最后一层
+        indices = []
+        for i in range(num_layers):
+            idx = int(i * (n - 1) / (num_layers - 1))
+            indices.append(idx)
+        
+        return sorted(set(indices))
     
     def load_json_data(self, json_path: str) -> List[Dict]:
         """加载JSON格式的数据"""
@@ -205,26 +392,20 @@ class AttentionMapAnalyzer:
         
         return spans
     
-    def get_attention_maps(
+    def get_attention_maps_with_hooks(
         self, 
         input_ids: torch.Tensor
-    ) -> Dict[int, torch.Tensor]:
-        """获取指定层的注意力图"""
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                output_attentions=True,
-                return_dict=True
-            )
+    ) -> Dict[int, np.ndarray]:
+        """使用 hooks 获取指定层的注意力图"""
         
-        attention_maps = {}
-        for layer_idx in self.selected_layers:
-            if layer_idx < len(outputs.attentions):
-                # Shape: (batch, num_heads, seq_len, seq_len)
-                attn = outputs.attentions[layer_idx]
-                # 平均所有头
-                attn_avg = attn.mean(dim=1)  # (batch, seq_len, seq_len)
-                attention_maps[layer_idx] = attn_avg[0].float().cpu().numpy()
+        # 使用上下文管理器安全地注册和移除 hooks
+        with AttentionCaptureContext(self.model, self.selected_layers) as ctx:
+            with torch.no_grad():
+                # 只需要前向传播，不需要 output_attentions
+                _ = self.model(input_ids=input_ids)
+            
+            # 获取捕获的 attention maps
+            attention_maps = ctx.get_attentions()
         
         return attention_maps
     
@@ -293,10 +474,7 @@ class AttentionMapAnalyzer:
         # 构建完整对话
         full_text = self.build_full_conversation(messages)
         
-        # 提取assistant内容中的标签
-        assistant_text = self.extract_assistant_content(messages)
-        
-        # 在完整文本中找标签位置（需要在完整文本中搜索）
+        # 在完整文本中找标签位置
         tag_spans = self.find_tag_spans(full_text)
         
         if not tag_spans:
@@ -316,7 +494,17 @@ class AttentionMapAnalyzer:
             return_offsets_mapping=True
         )
         
-        input_ids = encoding.input_ids.to(self.model.device)
+        # 获取第一个可用的 GPU 设备
+        if hasattr(self.model, 'device'):
+            device = self.model.device
+        elif hasattr(self.model, 'hf_device_map'):
+            # 多卡情况，获取第一个设备
+            first_device = next(iter(self.model.hf_device_map.values()))
+            device = torch.device(first_device) if isinstance(first_device, str) else first_device
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        input_ids = encoding.input_ids.to(device)
         seq_len = input_ids.shape[1]
         print(f"  Sequence length: {seq_len}")
         
@@ -329,9 +517,15 @@ class AttentionMapAnalyzer:
         for span in valid_spans:
             print(f"    - {span.tag_type}: tokens [{span.start_token}:{span.end_token}]")
         
-        # 获取attention maps
-        print(f"  Computing attention maps for layers {self.selected_layers}...")
-        attention_maps = self.get_attention_maps(input_ids)
+        # 使用 hooks 获取 attention maps
+        print(f"  Computing attention maps for layers {self.selected_layers} using hooks...")
+        attention_maps = self.get_attention_maps_with_hooks(input_ids)
+        
+        if not attention_maps:
+            print(f"  Warning: No attention maps captured. Trying alternative method...")
+            attention_maps = self._fallback_get_attention(input_ids)
+        
+        print(f"  Captured attention from {len(attention_maps)} layers: {list(attention_maps.keys())}")
         
         # 获取token文本（用于可视化）
         token_ids = input_ids[0].cpu().tolist()
@@ -354,7 +548,41 @@ class AttentionMapAnalyzer:
             )
             results.append(result)
         
+        # 清理 GPU 内存
+        del input_ids
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         return results
+    
+    def _fallback_get_attention(self, input_ids: torch.Tensor) -> Dict[int, np.ndarray]:
+        """备用方法：使用 output_attentions 但只保留需要的层"""
+        print("  Using fallback method with output_attentions...")
+        
+        attention_maps = {}
+        
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                output_attentions=True,
+                return_dict=True
+            )
+        
+        if outputs.attentions is not None:
+            for layer_idx in self.selected_layers:
+                if layer_idx < len(outputs.attentions):
+                    attn = outputs.attentions[layer_idx]
+                    attn_avg = attn.mean(dim=1).float().cpu().numpy()
+                    attention_maps[layer_idx] = attn_avg[0]
+                    # 立即删除原始 tensor
+                    del attn
+        
+        # 清理
+        del outputs
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        return attention_maps
     
     def analyze_dataset(
         self, 
@@ -370,8 +598,17 @@ class AttentionMapAnalyzer:
         all_results = []
         for i, sample in enumerate(data):
             print(f"\nAnalyzing sample {i+1}/{len(data)}...")
-            results = self.analyze_sample(sample, sample_id=i)
-            all_results.extend(results)
+            try:
+                results = self.analyze_sample(sample, sample_id=i)
+                all_results.extend(results)
+            except Exception as e:
+                print(f"  Error analyzing sample {i}: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # 每个样本后清理内存
+            gc.collect()
+            torch.cuda.empty_cache()
         
         return all_results
     
@@ -472,6 +709,10 @@ class AttentionMapAnalyzer:
             layer_data[r.layer_id] = r.cross_region_attention
         
         n_layers = len(layer_data)
+        if n_layers == 0:
+            print("No data to visualize")
+            return None
+        
         fig, axes = plt.subplots(1, n_layers, figsize=figsize)
         
         if n_layers == 1:
@@ -519,6 +760,8 @@ class AttentionMapAnalyzer:
             "=" * 60,
             "ATTENTION MAP ANALYSIS REPORT",
             "=" * 60,
+            f"Model: {self.model_path}",
+            f"Analyzed layers: {self.selected_layers}",
             ""
         ]
         
@@ -581,7 +824,9 @@ def main():
     parser.add_argument('--max_samples', type=int, default=5,
                        help='Maximum number of samples to analyze')
     parser.add_argument('--layers', type=str, default=None,
-                       help='Comma-separated layer indices to analyze (e.g., "0,16,31")')
+                       help='Comma-separated layer indices to analyze (e.g., "0,16,31,63")')
+    parser.add_argument('--num_layers', type=int, default=4,
+                       help='Number of layers to analyze if --layers not specified')
     parser.add_argument('--max_length', type=int, default=4096,
                        help='Maximum sequence length')
     
@@ -599,6 +844,7 @@ def main():
     analyzer = AttentionMapAnalyzer(
         model_path=args.model_path,
         selected_layers=selected_layers,
+        num_analysis_layers=args.num_layers,
         max_length=args.max_length
     )
     
@@ -624,8 +870,6 @@ def main():
         analyzer.visualize_attention_heatmap(r, output_path=output_path)
     
     # 生成跨区域注意力对比图
-    # 按样本分组
-    from collections import defaultdict
     by_sample = defaultdict(list)
     for r in results:
         by_sample[r.sample_id].append(r)

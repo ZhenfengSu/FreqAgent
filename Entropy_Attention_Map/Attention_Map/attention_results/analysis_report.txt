@@ -1,6 +1,8 @@
 ============================================================
 ATTENTION MAP ANALYSIS REPORT
 ============================================================
+Model: /mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B
+Analyzed layers: [8, 16, 24, 31]
 
 
 ========================================
