@@ -2,6 +2,7 @@
 Attention Map Analyzer for Large Language Models
 支持 32B 模型多卡运行，分析 <think>, <tool_call>, <tool_response> 等标签块的注意力分布
 使用 register_hook 方式只提取指定层的 attention，节省显存
+优化：支持长序列可视化、归一化 cross-region attention
 """
 
 import json
@@ -9,9 +10,12 @@ import re
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap, Normalize, LogNorm
+from matplotlib.collections import LineCollection
 import seaborn as sns
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any, Union
+from dataclasses import dataclass, field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from collections import defaultdict
 import warnings
@@ -40,49 +44,8 @@ class AttentionAnalysisResult:
     attention_matrix: np.ndarray
     token_texts: List[str]
     cross_region_attention: Dict[str, Dict[str, float]]
-
-
-class AttentionHook:
-    """用于捕获指定层 attention 的 Hook 类"""
-    
-    def __init__(self, layer_idx: int):
-        self.layer_idx = layer_idx
-        self.attention = None
-        self.handle = None
-    
-    def hook_fn(self, module, input, output):
-        """Hook 函数，捕获 attention weights"""
-        # 不同模型架构的输出格式可能不同
-        # 通常 attention 模块的输出是 (hidden_states, attention_weights, ...)
-        # 或者是一个包含 attention_weights 的 tuple/namedtuple
-        
-        if isinstance(output, tuple):
-            # 尝试找到 attention weights
-            for item in output:
-                if isinstance(item, torch.Tensor) and item.dim() == 4:
-                    # Shape: (batch, num_heads, seq_len, seq_len)
-                    # 检查是否是方阵（attention weights 特征）
-                    if item.shape[-1] == item.shape[-2]:
-                        # 平均所有头，转换为 CPU numpy，立即释放 GPU 内存
-                        self.attention = item.mean(dim=1).detach().float().cpu().numpy()
-                        return
-        elif hasattr(output, 'attentions') and output.attentions is not None:
-            attn = output.attentions
-            self.attention = attn.mean(dim=1).detach().float().cpu().numpy()
-    
-    def register(self, module):
-        """注册 hook"""
-        self.handle = module.register_forward_hook(self.hook_fn)
-    
-    def remove(self):
-        """移除 hook"""
-        if self.handle is not None:
-            self.handle.remove()
-            self.handle = None
-    
-    def clear(self):
-        """清理捕获的 attention"""
-        self.attention = None
+    # 新增：归一化后的 cross-region attention
+    cross_region_attention_normalized: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 class SelfAttentionHook:
@@ -95,12 +58,10 @@ class SelfAttentionHook:
     
     def hook_fn(self, module, args, kwargs, output):
         """Hook 函数 - 使用 forward hook with kwargs"""
-        # 处理不同的输出格式
         if isinstance(output, tuple) and len(output) >= 2:
-            # 通常第二个元素是 attention weights
             attn_weights = output[1]
             if attn_weights is not None and isinstance(attn_weights, torch.Tensor):
-                if attn_weights.dim() == 4:  # (batch, heads, seq, seq)
+                if attn_weights.dim() == 4:
                     self.attention = attn_weights.mean(dim=1).detach().float().cpu().numpy()
     
     def register(self, module):
@@ -134,15 +95,11 @@ class AttentionCaptureContext:
         """找到模型中的 attention 模块"""
         attention_modules = {}
         
-        # 尝试不同的模型架构
-        # Qwen2, LLaMA, Mistral 等常见架构
-        
         if hasattr(self.model, 'model'):
             base_model = self.model.model
         else:
             base_model = self.model
         
-        # 查找 layers
         layers = None
         for attr in ['layers', 'decoder_layers', 'h', 'blocks']:
             if hasattr(base_model, attr):
@@ -152,15 +109,12 @@ class AttentionCaptureContext:
         if layers is None:
             raise ValueError("Cannot find transformer layers in model")
         
-        # 查找每层的 attention 模块
         for idx in self.layer_indices:
             if idx >= len(layers):
                 print(f"Warning: Layer {idx} does not exist (model has {len(layers)} layers)")
                 continue
             
             layer = layers[idx]
-            
-            # 尝试找到 self-attention 模块
             attn_module = None
             for attr in ['self_attn', 'attention', 'attn', 'self_attention']:
                 if hasattr(layer, attr):
@@ -196,14 +150,13 @@ class AttentionCaptureContext:
         result = {}
         for layer_idx, hook in self.hooks.items():
             if hook.attention is not None:
-                result[layer_idx] = hook.attention[0]  # 取 batch 的第一个
+                result[layer_idx] = hook.attention[0]
         return result
 
 
 class AttentionMapAnalyzer:
     """注意力图分析器 - 使用 Hook 方式提取 attention"""
     
-    # 需要提取的标签模式
     TAG_PATTERNS = {
         'think': r'<think>(.*?)</think>',
         'tool_call': r'<tool_call>(.*?)</tool_call>',
@@ -211,7 +164,15 @@ class AttentionMapAnalyzer:
         'answer': r'<answer>(.*?)</answer>'
     }
     
-    # 默认分析 4 层
+    # 标签颜色配置
+    TAG_COLORS = {
+        'think': '#E74C3C',          # 红色
+        'tool_call': '#27AE60',      # 绿色
+        'tool_response': '#F39C12',  # 橙色
+        'answer': '#9B59B6',         # 紫色
+        'other': '#95A5A6'           # 灰色
+    }
+    
     DEFAULT_NUM_LAYERS = 4
     
     def __init__(
@@ -221,19 +182,8 @@ class AttentionMapAnalyzer:
         num_analysis_layers: int = 4,
         device_map: str = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
-        max_length: int = 4096
+        max_length: int = 32768
     ):
-        """
-        初始化分析器
-        
-        Args:
-            model_path: 模型路径
-            selected_layers: 要分析的层索引列表（如果指定，则忽略 num_analysis_layers）
-            num_analysis_layers: 要分析的层数（默认4层，均匀分布）
-            device_map: 设备映射策略，支持多卡
-            torch_dtype: 模型精度
-            max_length: 最大序列长度
-        """
         self.model_path = model_path
         self.max_length = max_length
         self.torch_dtype = torch_dtype
@@ -245,21 +195,18 @@ class AttentionMapAnalyzer:
         )
         
         print(f"Loading model with device_map='{device_map}'...")
-        # 注意：不需要 output_attentions=True，我们使用 hook
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map=device_map,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            attn_implementation="eager"  # 使用 eager 模式以获取完整 attention
+            attn_implementation="eager"
         )
         self.model.eval()
         
-        # 获取模型层数
         self.num_layers = self._get_num_layers()
         print(f"Model has {self.num_layers} layers")
         
-        # 设置要分析的层（默认选择 4 层，均匀分布）
         if selected_layers is not None:
             self.selected_layers = selected_layers
         else:
@@ -268,13 +215,11 @@ class AttentionMapAnalyzer:
         print(f"Selected layers for analysis: {self.selected_layers}")
     
     def _get_num_layers(self) -> int:
-        """获取模型层数"""
         if hasattr(self.model.config, 'num_hidden_layers'):
             return self.model.config.num_hidden_layers
         elif hasattr(self.model.config, 'n_layer'):
             return self.model.config.n_layer
         else:
-            # 尝试从模型结构获取
             if hasattr(self.model, 'model'):
                 base_model = self.model.model
             else:
@@ -287,12 +232,10 @@ class AttentionMapAnalyzer:
             raise ValueError("Cannot determine number of layers")
     
     def _get_uniform_layers(self, num_layers: int = 4) -> List[int]:
-        """获取均匀分布的层索引"""
         n = self.num_layers
         if num_layers >= n:
             return list(range(n))
         
-        # 均匀分布：包含第一层和最后一层
         indices = []
         for i in range(num_layers):
             idx = int(i * (n - 1) / (num_layers - 1))
@@ -301,14 +244,12 @@ class AttentionMapAnalyzer:
         return sorted(set(indices))
     
     def load_json_data(self, json_path: str) -> List[Dict]:
-        """加载JSON格式的数据"""
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         print(f"Loaded {len(data)} samples from {json_path}")
         return data
     
     def extract_assistant_content(self, messages: List[Dict]) -> str:
-        """提取所有assistant角色的内容并拼接"""
         assistant_contents = []
         for msg in messages:
             if msg.get('role') == 'assistant':
@@ -318,8 +259,6 @@ class AttentionMapAnalyzer:
         return '\n'.join(assistant_contents)
     
     def build_full_conversation(self, messages: List[Dict]) -> str:
-        """构建完整的对话文本（用于tokenization）"""
-        # 使用 chat template 如果可用
         if hasattr(self.tokenizer, 'apply_chat_template'):
             try:
                 return self.tokenizer.apply_chat_template(
@@ -330,7 +269,6 @@ class AttentionMapAnalyzer:
             except Exception as e:
                 print(f"Warning: apply_chat_template failed: {e}")
         
-        # 回退到简单拼接
         parts = []
         for msg in messages:
             role = msg.get('role', 'unknown')
@@ -339,7 +277,6 @@ class AttentionMapAnalyzer:
         return '\n'.join(parts)
     
     def find_tag_spans(self, text: str) -> List[TagSpan]:
-        """在文本中找到所有标签块的位置"""
         spans = []
         
         for tag_type, pattern in self.TAG_PATTERNS.items():
@@ -348,11 +285,10 @@ class AttentionMapAnalyzer:
                     tag_type=tag_type,
                     start_char=match.start(),
                     end_char=match.end(),
-                    content=match.group(1).strip()[:100]  # 保存前100字符作为预览
+                    content=match.group(1).strip()[:100]
                 )
                 spans.append(span)
         
-        # 按起始位置排序
         spans.sort(key=lambda x: x.start_char)
         return spans
     
@@ -362,8 +298,6 @@ class AttentionMapAnalyzer:
         spans: List[TagSpan],
         encoding
     ) -> List[TagSpan]:
-        """将字符位置映射到token位置"""
-        # 获取每个token的字符偏移
         token_offsets = []
         for i in range(len(encoding.input_ids[0])):
             try:
@@ -373,16 +307,13 @@ class AttentionMapAnalyzer:
             except:
                 continue
         
-        # 为每个span找到对应的token范围
         for span in spans:
             start_token = None
             end_token = None
             
             for token_idx, char_start, char_end in token_offsets:
-                # 找起始token
                 if start_token is None and char_end > span.start_char:
                     start_token = token_idx
-                # 找结束token
                 if char_start < span.end_char:
                     end_token = token_idx + 1
             
@@ -396,15 +327,9 @@ class AttentionMapAnalyzer:
         self, 
         input_ids: torch.Tensor
     ) -> Dict[int, np.ndarray]:
-        """使用 hooks 获取指定层的注意力图"""
-        
-        # 使用上下文管理器安全地注册和移除 hooks
         with AttentionCaptureContext(self.model, self.selected_layers) as ctx:
             with torch.no_grad():
-                # 只需要前向传播，不需要 output_attentions
                 _ = self.model(input_ids=input_ids)
-            
-            # 获取捕获的 attention maps
             attention_maps = ctx.get_attentions()
         
         return attention_maps
@@ -414,8 +339,14 @@ class AttentionMapAnalyzer:
         attention_matrix: np.ndarray,
         tag_spans: List[TagSpan],
         seq_len: int
-    ) -> Dict[str, Dict[str, float]]:
-        """分析不同区域之间的注意力流向"""
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """
+        分析不同区域之间的注意力流向
+        
+        Returns:
+            raw_attention: 原始平均注意力值
+            normalized_attention: 归一化后的注意力值（多种归一化策略）
+        """
         # 创建区域标记
         regions = {'other': []}
         token_to_region = ['other'] * seq_len
@@ -430,15 +361,18 @@ class AttentionMapAnalyzer:
                     token_to_region[t] = region_name
                     regions[region_name].append(t)
         
-        # 填充other区域
         regions['other'] = [i for i in range(seq_len) if token_to_region[i] == 'other']
         
-        # 计算区域间注意力
-        cross_attention = {}
+        # 计算区域间注意力（原始值）
+        raw_attention = {}
         region_names = list(regions.keys())
         
+        # 收集所有 (src, tgt) 对的注意力值
+        all_values = []
+        pair_values = {}
+        
         for src_region in region_names:
-            cross_attention[src_region] = {}
+            raw_attention[src_region] = {}
             src_tokens = regions[src_region]
             
             if not src_tokens:
@@ -447,7 +381,8 @@ class AttentionMapAnalyzer:
             for tgt_region in region_names:
                 tgt_tokens = regions[tgt_region]
                 if not tgt_tokens:
-                    cross_attention[src_region][tgt_region] = 0.0
+                    raw_attention[src_region][tgt_region] = 0.0
+                    pair_values[(src_region, tgt_region)] = 0.0
                     continue
                 
                 # 计算从 src 到 tgt 的平均注意力
@@ -459,22 +394,63 @@ class AttentionMapAnalyzer:
                             total_attn += attention_matrix[s, t]
                             count += 1
                 
-                cross_attention[src_region][tgt_region] = total_attn / max(count, 1)
+                avg_attn = total_attn / max(count, 1)
+                raw_attention[src_region][tgt_region] = avg_attn
+                pair_values[(src_region, tgt_region)] = avg_attn
+                all_values.append(avg_attn)
         
-        return cross_attention
+        # 归一化策略
+        normalized_attention = {}
+        
+        if all_values:
+            all_values = np.array(all_values)
+            non_zero_values = all_values[all_values > 0]
+            
+            if len(non_zero_values) > 0:
+                # 策略1: Min-Max 归一化
+                min_val = non_zero_values.min()
+                max_val = non_zero_values.max()
+                
+                # 策略2: 对数归一化（处理数值范围大的情况）
+                log_values = np.log1p(all_values * 1e6)  # 放大后取对数
+                log_min = log_values.min()
+                log_max = log_values.max()
+                
+                # 策略3: 按行归一化（每个 source region 的注意力分布）
+                for src_region in region_names:
+                    normalized_attention[src_region] = {}
+                    
+                    # 获取当前 source 的所有目标值
+                    src_values = []
+                    for tgt_region in region_names:
+                        if src_region in raw_attention and tgt_region in raw_attention.get(src_region, {}):
+                            src_values.append(raw_attention[src_region][tgt_region])
+                    
+                    src_values = np.array(src_values)
+                    src_sum = src_values.sum()
+                    
+                    for tgt_region in region_names:
+                        raw_val = raw_attention.get(src_region, {}).get(tgt_region, 0.0)
+                        
+                        # 使用行归一化（softmax-like）
+                        if src_sum > 0:
+                            norm_val = raw_val / src_sum
+                        else:
+                            norm_val = 0.0
+                        
+                        normalized_attention[src_region][tgt_region] = norm_val
+        else:
+            normalized_attention = raw_attention.copy()
+        
+        return raw_attention, normalized_attention
     
     def analyze_sample(
         self, 
         sample: Dict, 
         sample_id: int = 0
     ) -> List[AttentionAnalysisResult]:
-        """分析单个样本"""
         messages = sample.get('messages', [])
-        
-        # 构建完整对话
         full_text = self.build_full_conversation(messages)
-        
-        # 在完整文本中找标签位置
         tag_spans = self.find_tag_spans(full_text)
         
         if not tag_spans:
@@ -485,7 +461,6 @@ class AttentionMapAnalyzer:
         for span in tag_spans:
             print(f"    - {span.tag_type}: chars [{span.start_char}:{span.end_char}]")
         
-        # Tokenize
         encoding = self.tokenizer(
             full_text,
             return_tensors='pt',
@@ -494,11 +469,9 @@ class AttentionMapAnalyzer:
             return_offsets_mapping=True
         )
         
-        # 获取第一个可用的 GPU 设备
         if hasattr(self.model, 'device'):
             device = self.model.device
         elif hasattr(self.model, 'hf_device_map'):
-            # 多卡情况，获取第一个设备
             first_device = next(iter(self.model.hf_device_map.values()))
             device = torch.device(first_device) if isinstance(first_device, str) else first_device
         else:
@@ -508,16 +481,12 @@ class AttentionMapAnalyzer:
         seq_len = input_ids.shape[1]
         print(f"  Sequence length: {seq_len}")
         
-        # 映射token位置
         tag_spans = self.map_char_to_token_positions(full_text, tag_spans, encoding)
-        
-        # 过滤有效的spans
         valid_spans = [s for s in tag_spans if s.start_token >= 0 and s.end_token >= 0]
         print(f"  Valid spans with token positions: {len(valid_spans)}")
         for span in valid_spans:
             print(f"    - {span.tag_type}: tokens [{span.start_token}:{span.end_token}]")
         
-        # 使用 hooks 获取 attention maps
         print(f"  Computing attention maps for layers {self.selected_layers} using hooks...")
         attention_maps = self.get_attention_maps_with_hooks(input_ids)
         
@@ -527,14 +496,12 @@ class AttentionMapAnalyzer:
         
         print(f"  Captured attention from {len(attention_maps)} layers: {list(attention_maps.keys())}")
         
-        # 获取token文本（用于可视化）
         token_ids = input_ids[0].cpu().tolist()
         token_texts = [self.tokenizer.decode([tid]) for tid in token_ids]
         
-        # 分析每一层
         results = []
         for layer_idx, attn_matrix in attention_maps.items():
-            cross_attn = self.analyze_cross_region_attention(
+            raw_attn, norm_attn = self.analyze_cross_region_attention(
                 attn_matrix, valid_spans, seq_len
             )
             
@@ -544,11 +511,11 @@ class AttentionMapAnalyzer:
                 tag_spans=valid_spans,
                 attention_matrix=attn_matrix,
                 token_texts=token_texts,
-                cross_region_attention=cross_attn
+                cross_region_attention=raw_attn,
+                cross_region_attention_normalized=norm_attn
             )
             results.append(result)
         
-        # 清理 GPU 内存
         del input_ids
         gc.collect()
         torch.cuda.empty_cache()
@@ -556,9 +523,7 @@ class AttentionMapAnalyzer:
         return results
     
     def _fallback_get_attention(self, input_ids: torch.Tensor) -> Dict[int, np.ndarray]:
-        """备用方法：使用 output_attentions 但只保留需要的层"""
         print("  Using fallback method with output_attentions...")
-        
         attention_maps = {}
         
         with torch.no_grad():
@@ -574,10 +539,8 @@ class AttentionMapAnalyzer:
                     attn = outputs.attentions[layer_idx]
                     attn_avg = attn.mean(dim=1).float().cpu().numpy()
                     attention_maps[layer_idx] = attn_avg[0]
-                    # 立即删除原始 tensor
                     del attn
         
-        # 清理
         del outputs
         gc.collect()
         torch.cuda.empty_cache()
@@ -589,7 +552,6 @@ class AttentionMapAnalyzer:
         json_path: str,
         max_samples: int = None
     ) -> List[AttentionAnalysisResult]:
-        """分析整个数据集"""
         data = self.load_json_data(json_path)
         
         if max_samples:
@@ -606,80 +568,227 @@ class AttentionMapAnalyzer:
                 import traceback
                 traceback.print_exc()
             
-            # 每个样本后清理内存
             gc.collect()
             torch.cuda.empty_cache()
         
         return all_results
     
+    def _create_region_mask(
+        self,
+        seq_len: int,
+        tag_spans: List[TagSpan]
+    ) -> Tuple[np.ndarray, Dict[str, List[Tuple[int, int]]]]:
+        """
+        创建区域掩码和边界信息
+        
+        Returns:
+            region_labels: 每个 token 的区域标签数组
+            region_ranges: 每个区域的 (start, end) 范围列表
+        """
+        region_labels = np.array(['other'] * seq_len, dtype=object)
+        region_ranges = defaultdict(list)
+        
+        for span in tag_spans:
+            if span.start_token >= 0 and span.end_token >= 0:
+                start = max(0, span.start_token)
+                end = min(seq_len, span.end_token)
+                region_labels[start:end] = span.tag_type
+                region_ranges[span.tag_type].append((start, end))
+        
+        return region_labels, dict(region_ranges)
+    
     def visualize_attention_heatmap(
         self,
         result: AttentionAnalysisResult,
         output_path: str = None,
-        max_display_tokens: int = 200,
-        figsize: Tuple[int, int] = (16, 14)
+        max_display_tokens: int = None,
+        figsize: Tuple[int, int] = None,
+        show_region_bars: bool = True,
+        downsample_factor: int = None
     ):
-        """可视化注意力热力图，标注标签区域"""
+        """
+        可视化注意力热力图，标注标签区域
+        
+        针对长序列优化：
+        1. 添加区域颜色条带
+        2. 显示区域边界线
+        3. 支持降采样显示
+        4. 自动调整图像大小
+        """
         attn = result.attention_matrix
         spans = result.tag_spans
+        seq_len = attn.shape[0]
         
-        # 限制显示的token数量
-        display_len = min(attn.shape[0], max_display_tokens)
-        attn_display = attn[:display_len, :display_len]
+        # 自动决定是否降采样
+        if downsample_factor is None:
+            if seq_len > 8000:
+                downsample_factor = max(1, seq_len // 2000)
+            elif seq_len > 4000:
+                downsample_factor = max(1, seq_len // 1000)
+            else:
+                downsample_factor = 1
         
-        fig, ax = plt.subplots(figsize=figsize)
+        # 确定显示长度
+        if max_display_tokens is None:
+            max_display_tokens = seq_len
         
-        # 绘制热力图
-        sns.heatmap(
+        display_len = min(seq_len, max_display_tokens)
+        
+        # 降采样处理
+        if downsample_factor > 1:
+            # 使用 block averaging 降采样
+            new_len = display_len // downsample_factor
+            attn_display = np.zeros((new_len, new_len))
+            
+            for i in range(new_len):
+                for j in range(new_len):
+                    i_start = i * downsample_factor
+                    i_end = min((i + 1) * downsample_factor, display_len)
+                    j_start = j * downsample_factor
+                    j_end = min((j + 1) * downsample_factor, display_len)
+                    attn_display[i, j] = attn[i_start:i_end, j_start:j_end].mean()
+            
+            display_len = new_len
+            scale_factor = downsample_factor
+        else:
+            attn_display = attn[:display_len, :display_len]
+            scale_factor = 1
+        
+        # 自动调整图像大小
+        if figsize is None:
+            base_size = min(20, max(12, display_len / 100))
+            figsize = (base_size + 2, base_size)
+        
+        # 创建图像布局
+        if show_region_bars:
+            fig = plt.figure(figsize=figsize)
+            gs = fig.add_gridspec(
+                2, 2, 
+                width_ratios=[1, 20], 
+                height_ratios=[20, 1],
+                wspace=0.02, 
+                hspace=0.02
+            )
+            ax_main = fig.add_subplot(gs[0, 1])
+            ax_left = fig.add_subplot(gs[0, 0])
+            ax_bottom = fig.add_subplot(gs[1, 1])
+            ax_corner = fig.add_subplot(gs[1, 0])
+            ax_corner.axis('off')
+        else:
+            fig, ax_main = plt.subplots(figsize=figsize)
+        
+        # 绘制主热力图
+        im = ax_main.imshow(
             attn_display,
             cmap='Blues',
-            ax=ax,
-            cbar_kws={'label': 'Attention Weight'}
+            aspect='auto',
+            interpolation='nearest'
         )
         
-        # 标注标签区域
-        colors = {
-            'think': 'red',
-            'tool_call': 'green',
-            'tool_response': 'orange',
-            'answer': 'purple'
-        }
+        # 添加颜色条
+        cbar = plt.colorbar(im, ax=ax_main, fraction=0.046, pad=0.04)
+        cbar.set_label('Attention Weight', fontsize=10)
         
-        for span in spans:
-            if span.start_token < display_len and span.end_token <= display_len:
-                color = colors.get(span.tag_type, 'gray')
-                
-                # 画矩形框标注区域
-                rect = plt.Rectangle(
-                    (span.start_token, span.start_token),
-                    span.end_token - span.start_token,
-                    span.end_token - span.start_token,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=2,
-                    linestyle='--'
-                )
-                ax.add_patch(rect)
-                
-                # 添加标签
-                ax.annotate(
-                    f'<{span.tag_type}>',
-                    xy=(span.start_token, span.start_token),
-                    fontsize=8,
-                    color=color,
-                    fontweight='bold'
-                )
+        # 创建区域标签
+        region_labels, region_ranges = self._create_region_mask(seq_len, spans)
         
-        ax.set_title(f'Attention Map - Sample {result.sample_id}, Layer {result.layer_id}')
-        ax.set_xlabel('Key Position (attending to)')
-        ax.set_ylabel('Query Position (from)')
+        # 绘制区域边界和高亮
+        for tag_type, ranges in region_ranges.items():
+            color = self.TAG_COLORS.get(tag_type, '#CCCCCC')
+            
+            for start, end in ranges:
+                # 转换为显示坐标
+                disp_start = start // scale_factor
+                disp_end = end // scale_factor
+                
+                if disp_start < display_len and disp_end > 0:
+                    disp_start = max(0, disp_start)
+                    disp_end = min(display_len, disp_end)
+                    
+                    # 绘制边界框
+                    rect = plt.Rectangle(
+                        (disp_start - 0.5, disp_start - 0.5),
+                        disp_end - disp_start,
+                        disp_end - disp_start,
+                        fill=False,
+                        edgecolor=color,
+                        linewidth=2.5,
+                        linestyle='-',
+                        zorder=10
+                    )
+                    ax_main.add_patch(rect)
+                    
+                    # 绘制水平和垂直参考线（区域边界）
+                    ax_main.axhline(y=disp_start - 0.5, color=color, linewidth=1, alpha=0.5, linestyle='--')
+                    ax_main.axhline(y=disp_end - 0.5, color=color, linewidth=1, alpha=0.5, linestyle='--')
+                    ax_main.axvline(x=disp_start - 0.5, color=color, linewidth=1, alpha=0.5, linestyle='--')
+                    ax_main.axvline(x=disp_end - 0.5, color=color, linewidth=1, alpha=0.5, linestyle='--')
+        
+        # 绘制区域颜色条
+        if show_region_bars:
+            # 创建颜色映射
+            color_array = np.zeros((display_len, 1, 3))
+            for i in range(display_len):
+                orig_idx = min(i * scale_factor, seq_len - 1)
+                tag = region_labels[orig_idx]
+                color_hex = self.TAG_COLORS.get(tag, '#CCCCCC')
+                # 转换 hex 到 RGB
+                color_rgb = tuple(int(color_hex[i:i+2], 16) / 255 for i in (1, 3, 5))
+                color_array[i, 0, :] = color_rgb
+            
+            # 左侧颜色条（Query）
+            ax_left.imshow(color_array, aspect='auto', interpolation='nearest')
+            ax_left.set_xticks([])
+            ax_left.set_yticks([])
+            ax_left.set_ylabel('Query (from)', fontsize=10)
+            
+            # 底部颜色条（Key）
+            ax_bottom.imshow(
+                color_array.transpose(1, 0, 2), 
+                aspect='auto', 
+                interpolation='nearest'
+            )
+            ax_bottom.set_xticks([])
+            ax_bottom.set_yticks([])
+            ax_bottom.set_xlabel('Key (attending to)', fontsize=10)
+        
+        # 设置标题
+        title = f'Attention Map - Sample {result.sample_id}, Layer {result.layer_id}'
+        title += f'\n(Sequence length: {seq_len}'
+        if scale_factor > 1:
+            title += f', downsampled {scale_factor}x'
+        title += ')'
+        ax_main.set_title(title, fontsize=12, fontweight='bold')
         
         # 添加图例
-        legend_elements = [
-            plt.Line2D([0], [0], color=c, linewidth=2, linestyle='--', label=f'<{t}>')
-            for t, c in colors.items()
+        legend_patches = [
+            mpatches.Patch(color=color, label=f'<{tag}>')
+            for tag, color in self.TAG_COLORS.items()
+            if tag != 'other'
         ]
-        ax.legend(handles=legend_elements, loc='upper right')
+        ax_main.legend(
+            handles=legend_patches, 
+            loc='upper right',
+            fontsize=8,
+            framealpha=0.9
+        )
+        
+        # 添加区域统计信息
+        region_info = []
+        for span in spans:
+            if span.start_token >= 0:
+                region_info.append(
+                    f"<{span.tag_type}>: tokens {span.start_token}-{span.end_token}"
+                )
+        if region_info:
+            info_text = '\n'.join(region_info)
+            ax_main.text(
+                0.02, 0.98, info_text,
+                transform=ax_main.transAxes,
+                fontsize=7,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
         
         plt.tight_layout()
         
@@ -690,63 +799,455 @@ class AttentionMapAnalyzer:
         plt.close()
         return fig
     
+    def visualize_attention_heatmap_focused(
+        self,
+        result: AttentionAnalysisResult,
+        output_path: str = None,
+        figsize: Tuple[int, int] = (16, 14)
+    ):
+        """
+        只显示标签区域的 attention 热力图（聚焦视图）
+        适合长序列，只关注标签区域之间的注意力
+        """
+        attn = result.attention_matrix
+        spans = result.tag_spans
+        seq_len = attn.shape[0]
+        
+        if not spans:
+            print("No tag spans to visualize")
+            return None
+        
+        # 收集所有标签区域的 token
+        region_tokens = {}
+        for span in spans:
+            if span.start_token >= 0 and span.end_token >= 0:
+                key = f"{span.tag_type}_{span.start_token}"
+                region_tokens[key] = {
+                    'type': span.tag_type,
+                    'start': span.start_token,
+                    'end': span.end_token,
+                    'tokens': list(range(span.start_token, min(span.end_token, seq_len)))
+                }
+        
+        if not region_tokens:
+            print("No valid tag spans")
+            return None
+        
+        # 为每个区域计算代表性 attention（聚合）
+        region_names = list(region_tokens.keys())
+        n_regions = len(region_names)
+        
+        # 创建区域间 attention 矩阵
+        region_attn = np.zeros((n_regions, n_regions))
+        
+        for i, (name_i, info_i) in enumerate(region_tokens.items()):
+            for j, (name_j, info_j) in enumerate(region_tokens.items()):
+                # 计算从区域 i 到区域 j 的平均 attention
+                tokens_i = info_i['tokens']
+                tokens_j = info_j['tokens']
+                
+                total = 0.0
+                count = 0
+                for ti in tokens_i:
+                    for tj in tokens_j:
+                        if tj < ti:  # causal
+                            total += attn[ti, tj]
+                            count += 1
+                
+                if count > 0:
+                    region_attn[i, j] = total / count
+        
+        # 创建图
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # 左图：区域间 attention（原始值）
+        ax1 = axes[0]
+        labels = [f"{region_tokens[n]['type']}\n[{region_tokens[n]['start']}:{region_tokens[n]['end']}]" 
+                  for n in region_names]
+        
+        # 使用对数刻度显示
+        region_attn_display = region_attn.copy()
+        region_attn_display[region_attn_display == 0] = np.nan
+        
+        sns.heatmap(
+            region_attn_display,
+            xticklabels=labels,
+            yticklabels=labels,
+            annot=True,
+            fmt='.2e',
+            cmap='YlOrRd',
+            ax=ax1,
+            cbar_kws={'label': 'Attention (raw)'}
+        )
+        ax1.set_title('Region-to-Region Attention (Raw)', fontsize=11)
+        ax1.set_xlabel('Key Region')
+        ax1.set_ylabel('Query Region')
+        
+        # 右图：行归一化后的 attention
+        ax2 = axes[1]
+        row_sums = region_attn.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # 避免除零
+        region_attn_norm = region_attn / row_sums
+        
+        sns.heatmap(
+            region_attn_norm,
+            xticklabels=labels,
+            yticklabels=labels,
+            annot=True,
+            fmt='.2%',
+            cmap='YlOrRd',
+            ax=ax2,
+            vmin=0,
+            vmax=1,
+            cbar_kws={'label': 'Attention (row-normalized)'}
+        )
+        ax2.set_title('Region-to-Region Attention (Normalized)', fontsize=11)
+        ax2.set_xlabel('Key Region')
+        ax2.set_ylabel('Query Region')
+        
+        plt.suptitle(
+            f'Focused Attention Analysis - Sample {result.sample_id}, Layer {result.layer_id}',
+            fontsize=13,
+            fontweight='bold'
+        )
+        plt.tight_layout()
+        
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            print(f"Saved focused attention heatmap to {output_path}")
+        
+        plt.close()
+        return fig
+    
     def visualize_cross_region_attention(
         self,
         results: List[AttentionAnalysisResult],
         output_path: str = None,
-        figsize: Tuple[int, int] = (14, 10)
+        figsize: Tuple[int, int] = None,
+        use_normalized: bool = True,
+        normalization_type: str = 'row'
     ):
-        """可视化跨区域注意力流向（多层对比）"""
+        """
+        可视化跨区域注意力流向（多层对比）
+        
+        Args:
+            results: 分析结果列表
+            output_path: 输出路径
+            figsize: 图像大小
+            use_normalized: 是否使用归一化值
+            normalization_type: 归一化类型
+                - 'row': 行归一化（每个 source 的注意力分布）
+                - 'global': 全局归一化
+                - 'log': 对数归一化
+        """
         # 收集所有区域
         all_regions = set()
         for r in results:
             all_regions.update(r.cross_region_attention.keys())
-        regions = sorted(all_regions)
+        
+        # 排序区域（保持一致的顺序）
+        region_order = ['think', 'tool_call', 'tool_response', 'answer', 'other']
+        regions = [r for r in region_order if r in all_regions]
+        regions += [r for r in sorted(all_regions) if r not in region_order]
         
         # 按层组织数据
-        layer_data = defaultdict(dict)
+        layer_data = {}
         for r in results:
-            layer_data[r.layer_id] = r.cross_region_attention
+            layer_data[r.layer_id] = {
+                'raw': r.cross_region_attention,
+                'normalized': r.cross_region_attention_normalized
+            }
         
         n_layers = len(layer_data)
         if n_layers == 0:
             print("No data to visualize")
             return None
         
+        # 自动调整图像大小
+        if figsize is None:
+            figsize = (5 * n_layers + 2, 6)
+        
         fig, axes = plt.subplots(1, n_layers, figsize=figsize)
         
         if n_layers == 1:
             axes = [axes]
         
-        for idx, (layer_id, cross_attn) in enumerate(sorted(layer_data.items())):
-            # 构建矩阵
-            matrix = np.zeros((len(regions), len(regions)))
-            for i, src in enumerate(regions):
-                for j, tgt in enumerate(regions):
-                    if src in cross_attn and tgt in cross_attn[src]:
-                        matrix[i, j] = cross_attn[src][tgt]
-            
-            ax = axes[idx]
-            sns.heatmap(
-                matrix,
-                xticklabels=regions,
-                yticklabels=regions,
-                annot=True,
-                fmt='.3f',
-                cmap='YlOrRd',
-                ax=ax,
-                cbar=idx == n_layers - 1  # 只在最后一个显示colorbar
-            )
-            ax.set_title(f'Layer {layer_id}')
-            ax.set_xlabel('Target Region')
-            ax.set_ylabel('Source Region')
+        # 收集所有值用于全局归一化
+        all_values = []
+        for layer_id, data in layer_data.items():
+            cross_attn = data['raw']
+            for src in regions:
+                for tgt in regions:
+                    if src in cross_attn and tgt in cross_attn.get(src, {}):
+                        val = cross_attn[src][tgt]
+                        if val > 0:
+                            all_values.append(val)
         
-        plt.suptitle('Cross-Region Attention Flow', fontsize=14)
+        all_values = np.array(all_values) if all_values else np.array([1.0])
+        global_min = all_values.min() if len(all_values) > 0 else 0
+        global_max = all_values.max() if len(all_values) > 0 else 1
+        
+        for idx, (layer_id, data) in enumerate(sorted(layer_data.items())):
+            ax = axes[idx]
+            
+            if use_normalized and normalization_type == 'row':
+                cross_attn = data['normalized']
+                # 构建矩阵
+                matrix = np.zeros((len(regions), len(regions)))
+                for i, src in enumerate(regions):
+                    for j, tgt in enumerate(regions):
+                        if src in cross_attn and tgt in cross_attn.get(src, {}):
+                            matrix[i, j] = cross_attn[src][tgt]
+                
+                # 绘制热力图
+                sns.heatmap(
+                    matrix,
+                    xticklabels=regions,
+                    yticklabels=regions,
+                    annot=True,
+                    fmt='.1%',
+                    cmap='YlOrRd',
+                    ax=ax,
+                    vmin=0,
+                    vmax=1,
+                    cbar=idx == n_layers - 1,
+                    cbar_kws={'label': 'Attention (row-normalized)'} if idx == n_layers - 1 else {}
+                )
+                
+            elif normalization_type == 'log':
+                cross_attn = data['raw']
+                matrix = np.zeros((len(regions), len(regions)))
+                for i, src in enumerate(regions):
+                    for j, tgt in enumerate(regions):
+                        if src in cross_attn and tgt in cross_attn.get(src, {}):
+                            val = cross_attn[src][tgt]
+                            matrix[i, j] = np.log1p(val * 1e6)  # 对数变换
+                
+                # 归一化到 0-1
+                if matrix.max() > matrix.min():
+                    matrix = (matrix - matrix.min()) / (matrix.max() - matrix.min())
+                
+                sns.heatmap(
+                    matrix,
+                    xticklabels=regions,
+                    yticklabels=regions,
+                    annot=True,
+                    fmt='.2f',
+                    cmap='YlOrRd',
+                    ax=ax,
+                    vmin=0,
+                    vmax=1,
+                    cbar=idx == n_layers - 1,
+                    cbar_kws={'label': 'Attention (log-normalized)'} if idx == n_layers - 1 else {}
+                )
+                
+            elif normalization_type == 'global':
+                cross_attn = data['raw']
+                matrix = np.zeros((len(regions), len(regions)))
+                for i, src in enumerate(regions):
+                    for j, tgt in enumerate(regions):
+                        if src in cross_attn and tgt in cross_attn.get(src, {}):
+                            val = cross_attn[src][tgt]
+                            # 全局归一化
+                            if global_max > global_min:
+                                matrix[i, j] = (val - global_min) / (global_max - global_min)
+                            else:
+                                matrix[i, j] = 0
+                
+                sns.heatmap(
+                    matrix,
+                    xticklabels=regions,
+                    yticklabels=regions,
+                    annot=True,
+                    fmt='.2f',
+                    cmap='YlOrRd',
+                    ax=ax,
+                    vmin=0,
+                    vmax=1,
+                    cbar=idx == n_layers - 1,
+                    cbar_kws={'label': 'Attention (global-normalized)'} if idx == n_layers - 1 else {}
+                )
+            else:
+                # 原始值
+                cross_attn = data['raw']
+                matrix = np.zeros((len(regions), len(regions)))
+                for i, src in enumerate(regions):
+                    for j, tgt in enumerate(regions):
+                        if src in cross_attn and tgt in cross_attn.get(src, {}):
+                            matrix[i, j] = cross_attn[src][tgt]
+                
+                sns.heatmap(
+                    matrix,
+                    xticklabels=regions,
+                    yticklabels=regions,
+                    annot=True,
+                    fmt='.2e',
+                    cmap='YlOrRd',
+                    ax=ax,
+                    cbar=idx == n_layers - 1,
+                    cbar_kws={'label': 'Attention (raw)'} if idx == n_layers - 1 else {}
+                )
+            
+            ax.set_title(f'Layer {layer_id}', fontsize=11, fontweight='bold')
+            ax.set_xlabel('Target Region')
+            if idx == 0:
+                ax.set_ylabel('Source Region')
+            
+            # 为标签添加颜色
+            for i, label in enumerate(ax.get_yticklabels()):
+                label.set_color(self.TAG_COLORS.get(regions[i], 'black'))
+                label.set_fontweight('bold')
+            for i, label in enumerate(ax.get_xticklabels()):
+                label.set_color(self.TAG_COLORS.get(regions[i], 'black'))
+                label.set_fontweight('bold')
+        
+        norm_desc = {
+            'row': 'Row-Normalized',
+            'log': 'Log-Normalized', 
+            'global': 'Global-Normalized',
+            'raw': 'Raw Values'
+        }
+        plt.suptitle(
+            f'Cross-Region Attention Flow ({norm_desc.get(normalization_type if use_normalized else "raw", "Custom")})',
+            fontsize=13,
+            fontweight='bold'
+        )
         plt.tight_layout()
         
         if output_path:
             plt.savefig(output_path, dpi=150, bbox_inches='tight')
             print(f"Saved cross-region attention plot to {output_path}")
+        
+        plt.close()
+        return fig
+    
+    def visualize_attention_flow_diagram(
+        self,
+        result: AttentionAnalysisResult,
+        output_path: str = None,
+        figsize: Tuple[int, int] = (12, 8),
+        top_k_flows: int = 10
+    ):
+        """
+        可视化注意力流向图（桑基图风格）
+        显示各区域之间最强的注意力流向
+        """
+        spans = result.tag_spans
+        cross_attn = result.cross_region_attention
+        
+        # 收集所有区域
+        regions = list(cross_attn.keys())
+        
+        # 收集所有流向及其强度
+        flows = []
+        for src in regions:
+            for tgt in regions:
+                if src in cross_attn and tgt in cross_attn.get(src, {}):
+                    attn_val = cross_attn[src][tgt]
+                    if attn_val > 0:
+                        flows.append((src, tgt, attn_val))
+        
+        if not flows:
+            print("No attention flows to visualize")
+            return None
+        
+        # 按注意力强度排序，取 top_k
+        flows.sort(key=lambda x: x[2], reverse=True)
+        top_flows = flows[:top_k_flows]
+        
+        # 归一化流量强度用于可视化
+        max_flow = max(f[2] for f in top_flows)
+        min_flow = min(f[2] for f in top_flows)
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # 设置区域位置
+        unique_regions = sorted(set([f[0] for f in top_flows] + [f[1] for f in top_flows]))
+        n_regions = len(unique_regions)
+        
+        # 使用两列布局
+        region_positions = {}
+        for i, region in enumerate(unique_regions):
+            y = 1 - (i + 0.5) / n_regions
+            region_positions[region] = y
+        
+        # 绘制区域节点
+        for region, y in region_positions.items():
+            color = self.TAG_COLORS.get(region, '#CCCCCC')
+            
+            # 左侧节点（Source）
+            ax.add_patch(plt.Rectangle(
+                (0.1, y - 0.03), 0.15, 0.06,
+                facecolor=color, edgecolor='black', linewidth=2
+            ))
+            ax.text(0.175, y, region, ha='center', va='center', fontsize=10, fontweight='bold')
+            
+            # 右侧节点（Target）
+            ax.add_patch(plt.Rectangle(
+                (0.75, y - 0.03), 0.15, 0.06,
+                facecolor=color, edgecolor='black', linewidth=2
+            ))
+            ax.text(0.825, y, region, ha='center', va='center', fontsize=10, fontweight='bold')
+        
+        # 绘制流向箭头
+        for src, tgt, attn_val in top_flows:
+            src_y = region_positions[src]
+            tgt_y = region_positions[tgt]
+            
+            # 线宽与注意力强度成正比
+            if max_flow > min_flow:
+                normalized = (attn_val - min_flow) / (max_flow - min_flow)
+            else:
+                normalized = 1.0
+            
+            linewidth = 1 + normalized * 8
+            alpha = 0.3 + normalized * 0.6
+            
+            # 绘制曲线箭头
+            from matplotlib.patches import FancyArrowPatch
+            from matplotlib.path import Path
+            import matplotlib.patches as mpatches
+            
+            arrow = FancyArrowPatch(
+                (0.25, src_y), (0.75, tgt_y),
+                connectionstyle=f"arc3,rad={0.2 if src_y != tgt_y else 0}",
+                arrowstyle='->,head_length=10,head_width=6',
+                linewidth=linewidth,
+                color=self.TAG_COLORS.get(src, '#666666'),
+                alpha=alpha
+            )
+            ax.add_patch(arrow)
+            
+            # 添加注意力值标签
+            mid_x = 0.5
+            mid_y = (src_y + tgt_y) / 2
+            ax.text(
+                mid_x, mid_y, f'{attn_val:.2e}',
+                ha='center', va='center',
+                fontsize=7, alpha=0.8,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7)
+            )
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        ax.set_title(
+            f'Attention Flow Diagram - Sample {result.sample_id}, Layer {result.layer_id}\n(Top {len(top_flows)} flows)',
+            fontsize=12,
+            fontweight='bold'
+        )
+        
+        # 添加图例
+        ax.text(0.175, 1.05, 'Source', ha='center', fontsize=11, fontweight='bold')
+        ax.text(0.825, 1.05, 'Target', ha='center', fontsize=11, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            print(f"Saved attention flow diagram to {output_path}")
         
         plt.close()
         return fig
@@ -757,62 +1258,77 @@ class AttentionMapAnalyzer:
     ) -> str:
         """生成分析摘要报告"""
         report_lines = [
-            "=" * 60,
+            "=" * 70,
             "ATTENTION MAP ANALYSIS REPORT",
-            "=" * 60,
+            "=" * 70,
             f"Model: {self.model_path}",
             f"Analyzed layers: {self.selected_layers}",
             ""
         ]
         
-        # 按样本和层组织结果
         samples = defaultdict(list)
         for r in results:
             samples[r.sample_id].append(r)
         
         for sample_id, sample_results in sorted(samples.items()):
-            report_lines.append(f"\n{'='*40}")
+            report_lines.append(f"\n{'='*50}")
             report_lines.append(f"SAMPLE {sample_id}")
-            report_lines.append(f"{'='*40}")
+            report_lines.append(f"{'='*50}")
             
-            # 显示标签信息
             if sample_results:
                 spans = sample_results[0].tag_spans
-                report_lines.append(f"\nTag Spans Found: {len(spans)}")
+                seq_len = sample_results[0].attention_matrix.shape[0]
+                report_lines.append(f"\nSequence Length: {seq_len}")
+                report_lines.append(f"Tag Spans Found: {len(spans)}")
                 for span in spans:
                     report_lines.append(
-                        f"  - <{span.tag_type}>: tokens [{span.start_token}:{span.end_token}]"
+                        f"  - <{span.tag_type}>: tokens [{span.start_token}:{span.end_token}] "
+                        f"({span.end_token - span.start_token} tokens)"
                     )
             
-            # 每层的跨区域注意力统计
             report_lines.append("\nCross-Region Attention Summary:")
+            report_lines.append("-" * 40)
+            
             for r in sample_results:
                 report_lines.append(f"\n  Layer {r.layer_id}:")
                 
-                # 找出最强的注意力流向
+                # 使用归一化后的值
+                norm_attn = r.cross_region_attention_normalized
+                
+                # 找出每个区域最关注哪里
+                for src_region in ['think', 'tool_call', 'tool_response', 'answer']:
+                    if src_region in norm_attn:
+                        targets = norm_attn[src_region]
+                        if targets:
+                            sorted_targets = sorted(
+                                targets.items(), 
+                                key=lambda x: x[1], 
+                                reverse=True
+                            )
+                            top_3 = sorted_targets[:3]
+                            top_str = ', '.join([f"{t}: {v:.1%}" for t, v in top_3])
+                            report_lines.append(f"    {src_region} -> [{top_str}]")
+                
+                # 原始值统计
+                raw_attn = r.cross_region_attention
                 max_attn = 0
                 max_flow = ""
-                for src, targets in r.cross_region_attention.items():
+                for src, targets in raw_attn.items():
                     for tgt, attn in targets.items():
                         if attn > max_attn:
                             max_attn = attn
                             max_flow = f"{src} -> {tgt}"
                 
-                report_lines.append(f"    Strongest flow: {max_flow} ({max_attn:.4f})")
-                
-                # 各区域自注意力
-                for region in ['think', 'tool_call', 'tool_response', 'answer']:
-                    if region in r.cross_region_attention:
-                        self_attn = r.cross_region_attention[region].get(region, 0)
-                        report_lines.append(f"    {region} self-attention: {self_attn:.4f}")
+                report_lines.append(f"    [Strongest raw flow: {max_flow} ({max_attn:.2e})]")
         
         report = "\n".join(report_lines)
         return report
 
 
 def main():
-    """主函数示例"""
+    """主函数"""
     import argparse
+    import os
     
     parser = argparse.ArgumentParser(description='Analyze attention maps for LLM')
     parser.add_argument('--model_path', type=str, required=True,
@@ -827,15 +1343,16 @@ def main():
                        help='Comma-separated layer indices to analyze (e.g., "0,16,31,63")')
     parser.add_argument('--num_layers', type=int, default=4,
                        help='Number of layers to analyze if --layers not specified')
-    parser.add_argument('--max_length', type=int, default=4096,
+    parser.add_argument('--max_length', type=int, default=32768,
                        help='Maximum sequence length')
+    parser.add_argument('--normalization', type=str, default='row',
+                       choices=['row', 'log', 'global', 'raw'],
+                       help='Normalization type for cross-region attention')
     
     args = parser.parse_args()
     
-    import os
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 解析层索引
     selected_layers = None
     if args.layers:
         selected_layers = [int(x.strip()) for x in args.layers.split(',')]
@@ -861,25 +1378,47 @@ def main():
     # 生成可视化
     print("\nGenerating visualizations...")
     
-    # 为每个样本的每一层生成热力图
+    # 为每个样本的每一层生成多种可视化
     for r in results:
+        # 1. 完整热力图（带区域标注）
         output_path = os.path.join(
             args.output_dir, 
             f"attention_heatmap_sample{r.sample_id}_layer{r.layer_id}.png"
         )
         analyzer.visualize_attention_heatmap(r, output_path=output_path)
+        
+        # 2. 聚焦视图（只显示标签区域）
+        output_path = os.path.join(
+            args.output_dir,
+            f"attention_focused_sample{r.sample_id}_layer{r.layer_id}.png"
+        )
+        analyzer.visualize_attention_heatmap_focused(r, output_path=output_path)
+        
+        # 3. 注意力流向图
+        output_path = os.path.join(
+            args.output_dir,
+            f"attention_flow_sample{r.sample_id}_layer{r.layer_id}.png"
+        )
+        analyzer.visualize_attention_flow_diagram(r, output_path=output_path)
     
-    # 生成跨区域注意力对比图
+    # 按样本分组生成跨区域注意力对比图
     by_sample = defaultdict(list)
     for r in results:
         by_sample[r.sample_id].append(r)
     
     for sample_id, sample_results in by_sample.items():
-        output_path = os.path.join(
-            args.output_dir,
-            f"cross_region_attention_sample{sample_id}.png"
-        )
-        analyzer.visualize_cross_region_attention(sample_results, output_path=output_path)
+        # 使用不同的归一化方式
+        for norm_type in ['row', 'log', 'global']:
+            output_path = os.path.join(
+                args.output_dir,
+                f"cross_region_attention_sample{sample_id}_{norm_type}.png"
+            )
+            analyzer.visualize_cross_region_attention(
+                sample_results, 
+                output_path=output_path,
+                use_normalized=True,
+                normalization_type=norm_type
+            )
     
     # 生成报告
     report = analyzer.generate_summary_report(results)
