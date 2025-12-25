@@ -1,0 +1,46 @@
+{
+  "summary": {
+    "think": {
+      "avg_entropy": 0.8531678558054403,
+      "token_count": 1026
+    },
+    "tool_call": {
+      "avg_entropy": 0.17929691528934005,
+      "token_count": 366
+    },
+    "tool_response": {
+      "avg_entropy": 0.0,
+      "token_count": 0
+    },
+    "answer": {
+      "avg_entropy": 0.0,
+      "token_count": 0
+    }
+  },
+  "details": {
+    "think": {
+      "phase_name": "Think Phase (思考阶段)",
+      "token_count": 1026,
+      "average_entropy": 0.8531678558054403,
+      "std_entropy": 0.6198490034241687
+    },
+    "tool_call": {
+      "phase_name": "Action Phase (工具调用)",
+      "token_count": 366,
+      "average_entropy": 0.17929691528934005,
+      "std_entropy": 0.41279607217718906
+    },
+    "tool_response": {
+      "phase_name": "Tool Response (工具响应)",
+      "token_count": 0,
+      "average_entropy": 0.0,
+      "std_entropy": 0.0
+    },
+    "answer": {
+      "phase_name": "Answer Phase (回答阶段)",
+      "token_count": 0,
+      "average_entropy": 0.0,
+      "std_entropy": 0.0
+    }
+  }
+}
