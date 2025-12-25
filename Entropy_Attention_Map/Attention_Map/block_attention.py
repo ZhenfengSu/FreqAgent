@@ -582,7 +582,7 @@ class BlockAttentionAnalyzer:
             torch_dtype=torch_dtype,
             trust_remote_code=True,
             attn_implementation="eager",  # 必须使用eager以获取attention weights
-            output_attentions=True
+            output_attentions=False
         )
         self.model.eval()
         
@@ -660,7 +660,7 @@ class BlockAttentionAnalyzer:
         
         with torch.no_grad():
             input_ids = input_ids.to(self.model.device)
-            outputs = self.model(input_ids, output_attentions=True)
+            outputs = self.model(input_ids, output_attentions=False)
         
         # 4. 获取attention weights
         attention_weights = self.extractor.get_attention_weights()
