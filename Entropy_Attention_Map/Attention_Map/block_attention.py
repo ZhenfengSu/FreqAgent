@@ -1,17 +1,19 @@
 """
-Block Attention Map Visualization Tool
+Block Attention Map Visualization Tool (Optimized Version)
 用于可视化Agent对话流中不同语义块之间的注意力关系
+针对大模型多卡环境进行了显存优化
 """
 
 import json
 import re
+import gc
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Any
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict, Tuple, Optional, Any, Union
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from collections import OrderedDict
 import warnings
 warnings.filterwarnings('ignore')
@@ -193,67 +195,298 @@ class SemanticBlockParser:
 
 
 # ============================================================================
-# 3. 注意力提取器 (使用Hook)
+# 3. 优化的注意力提取器 (显存友好版本)
 # ============================================================================
 
-class AttentionExtractor:
-    """使用register_hook方式提取指定层的注意力权重"""
+class OptimizedAttentionExtractor:
+    """
+    优化的注意力提取器
+    - 支持分层提取，避免同时存储所有层的attention
+    - 立即将attention转移到CPU
+    - 支持分块聚合，避免存储完整的attention矩阵
+    """
     
-    def __init__(self, model, layer_indices: List[int]):
+    def __init__(self, model, blocks: List[SemanticBlock] = None):
         """
         Args:
             model: HuggingFace模型
-            layer_indices: 需要提取的层索引列表，如 [21, 31] 表示2/3层和最后一层
+            blocks: 语义块列表，用于实时聚合（可选）
         """
         self.model = model
-        self.layer_indices = layer_indices
-        self.attention_cache: Dict[int, torch.Tensor] = {}
+        self.blocks = blocks
         self.hooks = []
+        self.current_layer_idx = None
         
-    def _create_hook(self, layer_idx: int):
-        """创建attention hook"""
+        # 存储block-level的聚合结果，而不是完整的attention矩阵
+        self.block_attention_cache: Dict[int, np.ndarray] = {}
+        
+        # 临时存储当前层的attention（用于实时聚合）
+        self.temp_attention: Optional[torch.Tensor] = None
+        
+        # 聚合器
+        self.aggregator = BlockAttentionAggregator(aggregation_method="mean")
+        
+    def set_blocks(self, blocks: List[SemanticBlock]):
+        """设置语义块（用于实时聚合）"""
+        self.blocks = blocks
+        
+    def _create_aggregating_hook(self, layer_idx: int):
+        """
+        创建一个会实时聚合attention的hook
+        这样可以避免存储完整的[num_heads, seq_len, seq_len]矩阵
+        """
         def hook(module, input, output):
             # output通常是 (attn_output, attn_weights, past_key_value)
-            # 但不同模型结构可能不同
             if isinstance(output, tuple) and len(output) >= 2:
                 attn_weights = output[1]  # [batch, num_heads, seq_len, seq_len]
                 if attn_weights is not None:
-                    self.attention_cache[layer_idx] = attn_weights.detach().cpu()
+                    # 立即在GPU上进行head聚合，然后转移到CPU
+                    # 这样可以减少数据传输量
+                    with torch.no_grad():
+                        # 对heads取平均: [batch, num_heads, seq_len, seq_len] -> [batch, seq_len, seq_len]
+                        attn_mean = attn_weights.mean(dim=1)
+                        
+                        if self.blocks is not None:
+                            # 实时计算block-level attention
+                            block_attn = self._compute_block_attention_gpu(
+                                attn_mean[0], self.blocks
+                            )
+                            self.block_attention_cache[layer_idx] = block_attn
+                        else:
+                            # 如果没有blocks信息，存储聚合后的attention
+                            self.temp_attention = attn_mean[0].cpu().numpy()
+                            
+                    # 显式释放GPU内存
+                    del attn_weights
+                    torch.cuda.empty_cache()
+                    
         return hook
     
-    def register_hooks(self):
-        """注册hooks到指定层"""
-        # 清除旧的hooks
+    def _compute_block_attention_gpu(self, 
+                                      attention_matrix: torch.Tensor,
+                                      blocks: List[SemanticBlock]) -> np.ndarray:
+        """
+        在GPU上计算block-level attention，然后转移到CPU
+        这比先转移整个矩阵到CPU再计算更高效
+        
+        Args:
+            attention_matrix: [seq_len, seq_len] on GPU
+            blocks: 语义块列表
+        """
+        num_blocks = len(blocks)
+        block_attention = torch.zeros((num_blocks, num_blocks), device=attention_matrix.device)
+        
+        seq_len = attention_matrix.shape[0]
+        
+        for i, block_i in enumerate(blocks):
+            for j, block_j in enumerate(blocks):
+                start_i = min(block_i.start_idx, seq_len - 1)
+                end_i = min(block_i.end_idx, seq_len)
+                start_j = min(block_j.start_idx, seq_len - 1)
+                end_j = min(block_j.end_idx, seq_len)
+                
+                if end_i > start_i and end_j > start_j:
+                    sub_matrix = attention_matrix[start_i:end_i, start_j:end_j]
+                    block_attention[i, j] = sub_matrix.mean()
+        
+        # 转移到CPU并转换为numpy
+        result = block_attention.cpu().numpy()
+        
+        # 释放GPU tensor
+        del block_attention
+        
+        return result
+    
+    def _create_simple_hook(self, layer_idx: int):
+        """
+        创建简单的hook，只提取并立即转移到CPU
+        用于不进行实时聚合的场景
+        """
+        def hook(module, input, output):
+            if isinstance(output, tuple) and len(output) >= 2:
+                attn_weights = output[1]
+                if attn_weights is not None:
+                    with torch.no_grad():
+                        # 对heads取平均后立即转移到CPU
+                        attn_mean = attn_weights.mean(dim=1)[0].cpu()
+                        self.temp_attention = attn_mean.numpy()
+                    
+                    del attn_weights
+                    torch.cuda.empty_cache()
+                    
+        return hook
+    
+    def register_hook_for_layer(self, layer_idx: int, use_aggregation: bool = True):
+        """
+        只为单个层注册hook
+        
+        Args:
+            layer_idx: 要注册的层索引
+            use_aggregation: 是否使用实时聚合
+        """
         self.remove_hooks()
-        self.attention_cache.clear()
+        self.current_layer_idx = layer_idx
+        self.temp_attention = None
         
         # 获取模型的attention层
-        # 适配不同的模型架构
-        if hasattr(self.model, 'model'):
-            # LLaMA, Mistral等
-            layers = self.model.model.layers
-        elif hasattr(self.model, 'transformer'):
-            # GPT-2等
-            layers = self.model.transformer.h
+        layers = self._get_model_layers()
+        
+        if layer_idx < len(layers):
+            attn_module = layers[layer_idx].self_attn
+            
+            if use_aggregation and self.blocks is not None:
+                hook = attn_module.register_forward_hook(
+                    self._create_aggregating_hook(layer_idx)
+                )
+            else:
+                hook = attn_module.register_forward_hook(
+                    self._create_simple_hook(layer_idx)
+                )
+            
+            self.hooks.append(hook)
+            print(f"Registered hook on layer {layer_idx}")
+    
+    def _get_model_layers(self):
+        """获取模型的层列表"""
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            return self.model.model.layers
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            return self.model.transformer.h
         else:
             raise ValueError("Unsupported model architecture")
-        
-        for layer_idx in self.layer_indices:
-            if layer_idx < len(layers):
-                attn_module = layers[layer_idx].self_attn
-                hook = attn_module.register_forward_hook(self._create_hook(layer_idx))
-                self.hooks.append(hook)
-                print(f"Registered hook on layer {layer_idx}")
-                
+    
     def remove_hooks(self):
         """移除所有hooks"""
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
         
-    def get_attention_weights(self) -> Dict[int, torch.Tensor]:
-        """获取缓存的注意力权重"""
-        return self.attention_cache
+    def get_block_attention(self, layer_idx: int) -> Optional[np.ndarray]:
+        """获取指定层的block attention"""
+        return self.block_attention_cache.get(layer_idx)
+    
+    def get_temp_attention(self) -> Optional[np.ndarray]:
+        """获取临时存储的attention矩阵"""
+        return self.temp_attention
+    
+    def clear_cache(self):
+        """清除所有缓存"""
+        self.block_attention_cache.clear()
+        self.temp_attention = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+class ChunkedAttentionExtractor:
+    """
+    分块注意力提取器
+    对于超长序列，分块提取attention以减少显存使用
+    """
+    
+    def __init__(self, model, chunk_size: int = 2048):
+        """
+        Args:
+            model: HuggingFace模型
+            chunk_size: 每个chunk的最大序列长度
+        """
+        self.model = model
+        self.chunk_size = chunk_size
+        
+    def extract_block_attention_chunked(self,
+                                         input_ids: torch.Tensor,
+                                         blocks: List[SemanticBlock],
+                                         layer_idx: int) -> np.ndarray:
+        """
+        分块提取并聚合block-level attention
+        
+        注意：这种方法对于causal attention是近似的，
+        因为跨chunk的attention需要特殊处理
+        """
+        seq_len = input_ids.shape[1]
+        num_blocks = len(blocks)
+        
+        # 初始化block attention矩阵
+        block_attention = np.zeros((num_blocks, num_blocks))
+        block_counts = np.zeros((num_blocks, num_blocks))
+        
+        # 获取layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layers = self.model.model.layers
+        else:
+            layers = self.model.transformer.h
+        
+        # 分块处理
+        for chunk_start in range(0, seq_len, self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, seq_len)
+            
+            # 准备chunk输入
+            chunk_input = input_ids[:, :chunk_end].to(self.model.device)
+            
+            # 创建临时hook
+            temp_attention = [None]
+            
+            def hook(module, input, output):
+                if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                    with torch.no_grad():
+                        # 只取当前chunk对应的部分
+                        attn = output[1].mean(dim=1)[0]  # [seq_len, seq_len]
+                        # 只需要chunk_start:chunk_end行的attention
+                        if chunk_start > 0:
+                            temp_attention[0] = attn[chunk_start:chunk_end, :].cpu().numpy()
+                        else:
+                            temp_attention[0] = attn.cpu().numpy()
+            
+            handle = layers[layer_idx].self_attn.register_forward_hook(hook)
+            
+            try:
+                with torch.no_grad():
+                    self.model(chunk_input, output_attentions=False)
+            finally:
+                handle.remove()
+            
+            # 聚合到block attention
+            if temp_attention[0] is not None:
+                attn_chunk = temp_attention[0]
+                
+                for i, block_i in enumerate(blocks):
+                    # 检查block_i是否在当前chunk的query范围内
+                    if block_i.start_idx >= chunk_end or block_i.end_idx <= chunk_start:
+                        continue
+                    
+                    # 计算block_i在当前chunk中的有效范围
+                    local_start_i = max(0, block_i.start_idx - chunk_start)
+                    local_end_i = min(chunk_end - chunk_start, block_i.end_idx - chunk_start)
+                    
+                    if local_end_i <= local_start_i:
+                        continue
+                    
+                    for j, block_j in enumerate(blocks):
+                        # block_j在完整序列中的范围
+                        start_j = block_j.start_idx
+                        end_j = min(block_j.end_idx, chunk_end)
+                        
+                        if end_j <= start_j:
+                            continue
+                        
+                        # 提取子矩阵
+                        if local_start_i < attn_chunk.shape[0] and start_j < attn_chunk.shape[1]:
+                            actual_end_i = min(local_end_i, attn_chunk.shape[0])
+                            actual_end_j = min(end_j, attn_chunk.shape[1])
+                            
+                            sub_matrix = attn_chunk[local_start_i:actual_end_i, start_j:actual_end_j]
+                            if sub_matrix.size > 0:
+                                block_attention[i, j] += sub_matrix.sum()
+                                block_counts[i, j] += sub_matrix.size
+            
+            # 清理
+            del chunk_input
+            torch.cuda.empty_cache()
+        
+        # 平均
+        block_counts[block_counts == 0] = 1
+        block_attention = block_attention / block_counts
+        
+        return block_attention
 
 
 # ============================================================================
@@ -297,14 +530,17 @@ class BlockAttentionAggregator:
         num_blocks = len(blocks)
         block_attention = np.zeros((num_blocks, num_blocks))
         
+        seq_len = attention_matrix.shape[0]
+        
         for i, block_i in enumerate(blocks):  # Query blocks
             for j, block_j in enumerate(blocks):  # Key blocks
                 # 提取block_i对block_j的注意力子矩阵
-                start_i, end_i = block_i.start_idx, block_i.end_idx
-                start_j, end_j = block_j.start_idx, block_j.end_idx
+                start_i = min(block_i.start_idx, seq_len - 1)
+                end_i = min(block_i.end_idx, seq_len)
+                start_j = min(block_j.start_idx, seq_len - 1)
+                end_j = min(block_j.end_idx, seq_len)
                 
-                # 边界检查
-                if end_i > attention_matrix.shape[0] or end_j > attention_matrix.shape[1]:
+                if end_i <= start_i or end_j <= start_j:
                     continue
                     
                 sub_matrix = attention_matrix[start_i:end_i, start_j:end_j]
@@ -553,21 +789,32 @@ class BlockAttentionVisualizer:
 
 
 # ============================================================================
-# 6. 主Pipeline类
+# 6. 主Pipeline类 (优化版本)
 # ============================================================================
 
 class BlockAttentionAnalyzer:
-    """Block Attention分析的主类，整合所有组件"""
+    """
+    Block Attention分析的主类，整合所有组件
+    针对大模型进行了显存优化
+    """
     
     def __init__(self, 
                  model_name_or_path: str,
                  device_map: str = "auto",
-                 torch_dtype = torch.float16):
+                 torch_dtype = torch.float16,
+                 use_flash_attn: bool = False,
+                 load_in_8bit: bool = False,
+                 load_in_4bit: bool = False,
+                 max_memory: Dict[int, str] = None):
         """
         Args:
             model_name_or_path: 模型路径或HuggingFace模型名
             device_map: 设备映射策略
             torch_dtype: 数据类型
+            use_flash_attn: 是否使用flash attention (注意：使用flash attn时无法获取attention weights)
+            load_in_8bit: 是否使用8bit量化
+            load_in_4bit: 是否使用4bit量化
+            max_memory: 每张卡的最大显存使用，如 {0: "20GiB", 1: "20GiB", ...}
         """
         print(f"Loading model: {model_name_or_path}")
         
@@ -576,13 +823,46 @@ class BlockAttentionAnalyzer:
             trust_remote_code=True
         )
         
+        # 配置量化
+        quantization_config = None
+        if load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            print("Using 4-bit quantization")
+        elif load_in_8bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True
+            )
+            print("Using 8-bit quantization")
+        
+        # 设置max_memory以均衡显存使用
+        if max_memory is None and torch.cuda.device_count() > 1:
+            # 自动设置，为每张卡预留一些空间
+            max_memory = {}
+            for i in range(torch.cuda.device_count()):
+                # 获取每张卡的总显存
+                total_mem = torch.cuda.get_device_properties(i).total_memory
+                # 使用80%的显存
+                max_memory[i] = f"{int(total_mem * 0.8 / 1024**3)}GiB"
+            max_memory["cpu"] = "50GiB"
+            print(f"Auto max_memory: {max_memory}")
+        
+        # 加载模型
+        # 注意：必须使用 attn_implementation="eager" 来获取attention weights
+        # 但eager模式在某些情况下可能导致显存集中
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             device_map=device_map,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
             attn_implementation="eager",  # 必须使用eager以获取attention weights
-            output_attentions=False
+            quantization_config=quantization_config,
+            max_memory=max_memory,
+            low_cpu_mem_usage=True
         )
         self.model.eval()
         
@@ -594,16 +874,13 @@ class BlockAttentionAnalyzer:
         print(f"Model loaded. Total layers: {self.num_layers}")
         print(f"Will extract attention from layers: {self.layer_2_3} (2/3) and {self.last_layer} (last)")
         
+        # 打印设备分布
+        self._print_device_distribution()
+        
         # 初始化组件
         self.parser = SemanticBlockParser(self.tokenizer)
         self.aggregator = BlockAttentionAggregator(aggregation_method="mean")
         self.visualizer = BlockAttentionVisualizer()
-        
-        # 初始化attention extractor
-        self.extractor = AttentionExtractor(
-            self.model, 
-            [self.layer_2_3, self.last_layer]
-        )
         
     def _get_num_layers(self) -> int:
         """获取模型层数"""
@@ -614,21 +891,56 @@ class BlockAttentionAnalyzer:
         else:
             raise ValueError("Cannot determine number of layers")
     
+    def _get_model_layers(self):
+        """获取模型的层列表"""
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            return self.model.model.layers
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            return self.model.transformer.h
+        else:
+            raise ValueError("Unsupported model architecture")
+    
+    def _print_device_distribution(self):
+        """打印模型在各设备上的分布"""
+        if hasattr(self.model, 'hf_device_map'):
+            device_map = self.model.hf_device_map
+            device_counts = {}
+            for name, device in device_map.items():
+                device = str(device)
+                device_counts[device] = device_counts.get(device, 0) + 1
+            print(f"Model device distribution: {device_counts}")
+    
+    def _get_layer_device(self, layer_idx: int) -> torch.device:
+        """获取指定层所在的设备"""
+        layers = self._get_model_layers()
+        if layer_idx < len(layers):
+            # 尝试获取层的设备
+            for param in layers[layer_idx].parameters():
+                return param.device
+        return torch.device("cuda:0")
+    
     def analyze_conversation(self, 
                             messages: List[Dict],
                             normalize: str = "row",
-                            return_raw: bool = False) -> Dict[str, Any]:
+                            layer_indices: List[int] = None,
+                            use_chunked: bool = False,
+                            chunk_size: int = 2048) -> Dict[str, Any]:
         """
         分析单个对话的Block Attention
         
         Args:
             messages: 对话消息列表
             normalize: 归一化方法
-            return_raw: 是否返回原始attention矩阵
+            layer_indices: 要分析的层索引列表，默认为 [2/3层, 最后一层]
+            use_chunked: 是否使用分块处理（对于超长序列）
+            chunk_size: 分块大小
             
         Returns:
             分析结果字典
         """
+        if layer_indices is None:
+            layer_indices = [self.layer_2_3, self.last_layer]
+        
         # 1. 解析语义块
         blocks = self.parser.parse_messages(messages)
         print(f"Parsed {len(blocks)} semantic blocks:")
@@ -636,7 +948,6 @@ class BlockAttentionAnalyzer:
             print(f"  [{i}] {block.block_type} (turn {block.turn_idx}): {block.content[:50]}...")
         
         # 2. 构建完整输入
-        # 使用chat template如果可用
         if hasattr(self.tokenizer, 'apply_chat_template'):
             input_text = self.tokenizer.apply_chat_template(
                 messages, 
@@ -653,51 +964,201 @@ class BlockAttentionAnalyzer:
         # 重新计算每个block的token索引
         blocks = self._recompute_block_indices(blocks, input_text)
         
-        print(f"Total tokens: {input_ids.shape[1]}")
+        seq_len = input_ids.shape[1]
+        print(f"Total tokens: {seq_len}")
         
-        # 3. 注册hooks并前向传播
-        self.extractor.register_hooks()
-        
-        with torch.no_grad():
-            input_ids = input_ids.to(self.model.device)
-            outputs = self.model(input_ids, output_attentions=False)
-        
-        # 4. 获取attention weights
-        attention_weights = self.extractor.get_attention_weights()
-        
-        # 如果hook没有捕获到，尝试从outputs获取
-        if not attention_weights and hasattr(outputs, 'attentions') and outputs.attentions:
-            print("Getting attention from model outputs...")
-            for layer_idx in [self.layer_2_3, self.last_layer]:
-                if layer_idx < len(outputs.attentions):
-                    attention_weights[layer_idx] = outputs.attentions[layer_idx].cpu()
-        
-        self.extractor.remove_hooks()
-        
-        # 5. 聚合为Block-level attention
+        # 3. 逐层提取attention（显存优化的关键）
         block_attention_maps = {}
         
-        for layer_idx, attn in attention_weights.items():
-            # attn shape: [batch, num_heads, seq_len, seq_len]
-            attn_np = attn[0].numpy()  # 取第一个batch
+        if use_chunked and seq_len > chunk_size:
+            # 使用分块处理
+            print(f"Using chunked extraction (chunk_size={chunk_size})")
+            chunked_extractor = ChunkedAttentionExtractor(self.model, chunk_size)
             
-            # 聚合
-            block_attn = self.aggregator.aggregate(attn_np, blocks, head_aggregation="mean")
-            block_attn = self.aggregator.normalize(block_attn, method=normalize)
+            for layer_idx in layer_indices:
+                print(f"Extracting attention from layer {layer_idx}...")
+                block_attn = chunked_extractor.extract_block_attention_chunked(
+                    input_ids, blocks, layer_idx
+                )
+                block_attn = self.aggregator.normalize(block_attn, method=normalize)
+                block_attention_maps[layer_idx] = block_attn
+                
+                # 清理显存
+                gc.collect()
+                torch.cuda.empty_cache()
+        else:
+            # 使用优化的hook方式，逐层提取
+            extractor = OptimizedAttentionExtractor(self.model)
+            extractor.set_blocks(blocks)
             
-            block_attention_maps[layer_idx] = block_attn
+            for layer_idx in layer_indices:
+                print(f"Extracting attention from layer {layer_idx}...")
+                
+                # 只为当前层注册hook
+                extractor.register_hook_for_layer(layer_idx, use_aggregation=True)
+                
+                # 前向传播
+                # 将输入放到第一层所在的设备
+                input_device = self._get_layer_device(0)
+                input_ids_device = input_ids.to(input_device)
+                
+                with torch.no_grad():
+                    try:
+                        self.model(input_ids_device, output_attentions=False, use_cache=False)
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            print(f"OOM on layer {layer_idx}, trying chunked extraction...")
+                            extractor.remove_hooks()
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            
+                            # 回退到分块处理
+                            chunked_extractor = ChunkedAttentionExtractor(self.model, chunk_size)
+                            block_attn = chunked_extractor.extract_block_attention_chunked(
+                                input_ids, blocks, layer_idx
+                            )
+                            block_attn = self.aggregator.normalize(block_attn, method=normalize)
+                            block_attention_maps[layer_idx] = block_attn
+                            continue
+                        else:
+                            raise e
+                
+                # 获取block attention
+                block_attn = extractor.get_block_attention(layer_idx)
+                if block_attn is not None:
+                    block_attn = self.aggregator.normalize(block_attn, method=normalize)
+                    block_attention_maps[layer_idx] = block_attn
+                
+                # 清理
+                extractor.remove_hooks()
+                extractor.clear_cache()
+                del input_ids_device
+                gc.collect()
+                torch.cuda.empty_cache()
             
         result = {
             "blocks": blocks,
             "block_attention_maps": block_attention_maps,
-            "layer_indices": list(attention_weights.keys()),
-            "total_tokens": input_ids.shape[1]
+            "layer_indices": layer_indices,
+            "total_tokens": seq_len
         }
-        
-        if return_raw:
-            result["raw_attention"] = {k: v.numpy() for k, v in attention_weights.items()}
             
         return result
+    
+    def analyze_conversation_sequential(self, 
+                                        messages: List[Dict],
+                                        normalize: str = "row",
+                                        layer_indices: List[int] = None) -> Dict[str, Any]:
+        """
+        顺序分析方法 - 完全顺序地处理每一层
+        这是最保守的方法，最大程度减少显存使用
+        
+        Args:
+            messages: 对话消息列表
+            normalize: 归一化方法
+            layer_indices: 要分析的层索引列表
+            
+        Returns:
+            分析结果字典
+        """
+        if layer_indices is None:
+            layer_indices = [self.layer_2_3, self.last_layer]
+        
+        # 1. 解析语义块
+        blocks = self.parser.parse_messages(messages)
+        print(f"Parsed {len(blocks)} semantic blocks")
+        
+        # 2. 构建完整输入
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            input_text = self.tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+        else:
+            input_text = ""
+            for msg in messages:
+                input_text += f"<|{msg['role']}|>\n{msg['content']}\n"
+        
+        input_ids = self.tokenizer.encode(input_text, return_tensors="pt")
+        blocks = self._recompute_block_indices(blocks, input_text)
+        
+        seq_len = input_ids.shape[1]
+        print(f"Total tokens: {seq_len}")
+        
+        # 3. 逐层处理
+        block_attention_maps = {}
+        layers = self._get_model_layers()
+        
+        for layer_idx in layer_indices:
+            print(f"Processing layer {layer_idx}...")
+            
+            # 创建用于存储结果的容器
+            result_container = {"block_attention": None}
+            
+            def create_hook(blocks_ref, result_ref):
+                def hook(module, input, output):
+                    if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                        with torch.no_grad():
+                            attn_weights = output[1]  # [batch, num_heads, seq_len, seq_len]
+                            # 立即在GPU上聚合
+                            attn_mean = attn_weights.mean(dim=1)[0]  # [seq_len, seq_len]
+                            
+                            # 计算block attention
+                            num_blocks = len(blocks_ref)
+                            block_attn = torch.zeros((num_blocks, num_blocks), 
+                                                    device=attn_mean.device)
+                            
+                            for i, block_i in enumerate(blocks_ref):
+                                for j, block_j in enumerate(blocks_ref):
+                                    si = min(block_i.start_idx, seq_len - 1)
+                                    ei = min(block_i.end_idx, seq_len)
+                                    sj = min(block_j.start_idx, seq_len - 1)
+                                    ej = min(block_j.end_idx, seq_len)
+                                    
+                                    if ei > si and ej > sj:
+                                        sub = attn_mean[si:ei, sj:ej]
+                                        block_attn[i, j] = sub.mean()
+                            
+                            result_ref["block_attention"] = block_attn.cpu().numpy()
+                            
+                            # 立即释放
+                            del attn_weights, attn_mean, block_attn
+                            
+                return hook
+            
+            # 注册hook
+            handle = layers[layer_idx].self_attn.register_forward_hook(
+                create_hook(blocks, result_container)
+            )
+            
+            try:
+                # 前向传播
+                input_device = self._get_layer_device(0)
+                input_ids_device = input_ids.to(input_device)
+                
+                with torch.no_grad():
+                    self.model(input_ids_device, output_attentions=False, use_cache=False)
+                
+                # 获取结果
+                if result_container["block_attention"] is not None:
+                    block_attn = self.aggregator.normalize(
+                        result_container["block_attention"], 
+                        method=normalize
+                    )
+                    block_attention_maps[layer_idx] = block_attn
+                    
+            finally:
+                handle.remove()
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        return {
+            "blocks": blocks,
+            "block_attention_maps": block_attention_maps,
+            "layer_indices": layer_indices,
+            "total_tokens": seq_len
+        }
     
     def _recompute_block_indices(self, blocks: List[SemanticBlock], 
                                   full_text: str) -> List[SemanticBlock]:
@@ -706,15 +1167,21 @@ class BlockAttentionAnalyzer:
         
         for block in blocks:
             # 查找block内容在全文中的位置
-            content_start = full_text.find(block.content[:50], current_pos)  # 用前50字符查找
+            search_content = block.content[:50] if len(block.content) > 50 else block.content
+            content_start = full_text.find(search_content, current_pos)
             
             if content_start == -1:
-                # 找不到精确匹配，使用估计位置
                 content_start = current_pos
             
             # 计算token索引
-            prefix_tokens = self.tokenizer.encode(full_text[:content_start], add_special_tokens=False)
-            content_tokens = self.tokenizer.encode(block.content, add_special_tokens=False)
+            prefix_tokens = self.tokenizer.encode(
+                full_text[:content_start], 
+                add_special_tokens=False
+            )
+            content_tokens = self.tokenizer.encode(
+                block.content, 
+                add_special_tokens=False
+            )
             
             block.start_idx = len(prefix_tokens)
             block.end_idx = block.start_idx + len(content_tokens)
@@ -735,6 +1202,8 @@ class BlockAttentionAnalyzer:
         for layer_idx, block_attn in attention_maps.items():
             save_path = None
             if save_dir:
+                import os
+                os.makedirs(save_dir, exist_ok=True)
                 save_path = f"{save_dir}/block_attention_layer_{layer_idx}.png"
             
             self.visualizer.plot_attention_map(
@@ -767,7 +1236,199 @@ class BlockAttentionAnalyzer:
 
 
 # ============================================================================
-# 7. 简化版本 (不需要实际模型，用于演示)
+# 7. 轻量级分析器 (使用采样方式)
+# ============================================================================
+
+class LightweightBlockAttentionAnalyzer:
+    """
+    轻量级Block Attention分析器
+    使用采样方式来减少显存使用 - 只对每个block的部分token进行采样
+    """
+    
+    def __init__(self, 
+                 model_name_or_path: str,
+                 device_map: str = "auto",
+                 torch_dtype = torch.float16,
+                 sample_ratio: float = 0.1,
+                 max_samples_per_block: int = 50):
+        """
+        Args:
+            sample_ratio: 每个block采样的token比例
+            max_samples_per_block: 每个block最大采样token数
+        """
+        print(f"Loading model: {model_name_or_path}")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True
+        )
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True
+        )
+        self.model.eval()
+        
+        self.sample_ratio = sample_ratio
+        self.max_samples_per_block = max_samples_per_block
+        
+        # 获取层数
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            self.num_layers = len(self.model.model.layers)
+            self.layers = self.model.model.layers
+        else:
+            self.num_layers = len(self.model.transformer.h)
+            self.layers = self.model.transformer.h
+            
+        self.parser = SemanticBlockParser(self.tokenizer)
+        self.aggregator = BlockAttentionAggregator()
+        self.visualizer = BlockAttentionVisualizer()
+        
+    def _get_sample_indices(self, blocks: List[SemanticBlock]) -> Dict[int, List[int]]:
+        """为每个block生成采样索引"""
+        sample_indices = {}
+        
+        for i, block in enumerate(blocks):
+            num_tokens = block.end_idx - block.start_idx
+            num_samples = min(
+                max(1, int(num_tokens * self.sample_ratio)),
+                self.max_samples_per_block
+            )
+            
+            if num_samples >= num_tokens:
+                indices = list(range(block.start_idx, block.end_idx))
+            else:
+                indices = np.linspace(
+                    block.start_idx, 
+                    block.end_idx - 1, 
+                    num_samples, 
+                    dtype=int
+                ).tolist()
+            
+            sample_indices[i] = indices
+            
+        return sample_indices
+    
+    def analyze_with_sampling(self,
+                             messages: List[Dict],
+                             layer_indices: List[int] = None,
+                             normalize: str = "row") -> Dict[str, Any]:
+        """
+        使用采样方式分析attention
+        
+        Args:
+            messages: 消息列表
+            layer_indices: 层索引列表
+            normalize: 归一化方法
+        """
+        if layer_indices is None:
+            layer_2_3 = int(self.num_layers * 2 / 3)
+            layer_indices = [layer_2_3, self.num_layers - 1]
+        
+        # 解析blocks
+        blocks = self.parser.parse_messages(messages)
+        
+        # 构建输入
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            input_text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+        else:
+            input_text = "".join([f"<|{m['role']}|>\n{m['content']}\n" for m in messages])
+        
+        input_ids = self.tokenizer.encode(input_text, return_tensors="pt")
+        
+        # 重新计算block索引
+        current_pos = 0
+        for block in blocks:
+            search_content = block.content[:50]
+            content_start = input_text.find(search_content, current_pos)
+            if content_start == -1:
+                content_start = current_pos
+            
+            prefix_tokens = self.tokenizer.encode(
+                input_text[:content_start], add_special_tokens=False
+            )
+            content_tokens = self.tokenizer.encode(
+                block.content, add_special_tokens=False
+            )
+            
+            block.start_idx = len(prefix_tokens)
+            block.end_idx = block.start_idx + len(content_tokens)
+            block.token_count = len(content_tokens)
+            current_pos = content_start + len(block.content)
+        
+        seq_len = input_ids.shape[1]
+        print(f"Total tokens: {seq_len}, Blocks: {len(blocks)}")
+        
+        # 获取采样索引
+        sample_indices = self._get_sample_indices(blocks)
+        
+        # 逐层分析
+        block_attention_maps = {}
+        
+        for layer_idx in layer_indices:
+            print(f"Processing layer {layer_idx} with sampling...")
+            
+            num_blocks = len(blocks)
+            block_attention = np.zeros((num_blocks, num_blocks))
+            
+            result_container = {"attn": None}
+            
+            def hook(module, input, output):
+                if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                    with torch.no_grad():
+                        # 只保存采样位置的attention
+                        attn = output[1].mean(dim=1)[0]  # [seq_len, seq_len]
+                        result_container["attn"] = attn.cpu()
+                        del output[1]
+            
+            handle = self.layers[layer_idx].self_attn.register_forward_hook(hook)
+            
+            try:
+                input_device = next(self.model.parameters()).device
+                with torch.no_grad():
+                    self.model(input_ids.to(input_device), output_attentions=False, use_cache=False)
+                
+                if result_container["attn"] is not None:
+                    attn = result_container["attn"].numpy()
+                    
+                    # 使用采样计算block attention
+                    for i in range(num_blocks):
+                        for j in range(num_blocks):
+                            i_indices = sample_indices[i]
+                            j_indices = sample_indices[j]
+                            
+                            # 过滤有效索引
+                            i_indices = [idx for idx in i_indices if idx < seq_len]
+                            j_indices = [idx for idx in j_indices if idx < seq_len]
+                            
+                            if i_indices and j_indices:
+                                sub_attn = attn[np.ix_(i_indices, j_indices)]
+                                block_attention[i, j] = sub_attn.mean()
+                    
+                    block_attention = self.aggregator.normalize(block_attention, normalize)
+                    block_attention_maps[layer_idx] = block_attention
+                    
+            finally:
+                handle.remove()
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        return {
+            "blocks": blocks,
+            "block_attention_maps": block_attention_maps,
+            "layer_indices": layer_indices,
+            "total_tokens": seq_len
+        }
+
+
+# ============================================================================
+# 8. 简化版本 (不需要实际模型，用于演示)
 # ============================================================================
 
 class DemoBlockAttentionAnalyzer:
@@ -797,12 +1458,11 @@ class DemoBlockAttentionAnalyzer:
                     content=content,
                     role=role,
                     turn_idx=turn_idx,
-                    token_count=len(content.split()) * 2  # 估计token数
+                    token_count=len(content.split()) * 2
                 ))
                 
             elif role == "user":
                 if "<tool_response>" in content:
-                    # 提取tool_response
                     match = re.search(r"<tool_response>(.*?)</tool_response>", content, re.DOTALL)
                     if match:
                         blocks.append(SemanticBlock(
@@ -828,10 +1488,8 @@ class DemoBlockAttentionAnalyzer:
                     turn_idx += 1
                     
             elif role == "assistant":
-                # 解析think, tool_call, answer
                 remaining = content
                 
-                # Think
                 for match in re.finditer(r"<think>(.*?)</think>", content, re.DOTALL):
                     blocks.append(SemanticBlock(
                         block_type="think",
@@ -842,7 +1500,6 @@ class DemoBlockAttentionAnalyzer:
                     ))
                     remaining = remaining.replace(match.group(0), "")
                 
-                # Tool call
                 for match in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
                     blocks.append(SemanticBlock(
                         block_type="tool_call",
@@ -853,7 +1510,6 @@ class DemoBlockAttentionAnalyzer:
                     ))
                     remaining = remaining.replace(match.group(0), "")
                 
-                # Answer
                 remaining = remaining.strip()
                 if remaining:
                     blocks.append(SemanticBlock(
@@ -864,7 +1520,6 @@ class DemoBlockAttentionAnalyzer:
                         token_count=len(remaining.split()) * 2
                     ))
         
-        # 设置索引
         current_idx = 0
         for block in blocks:
             block.start_idx = current_idx
@@ -876,15 +1531,7 @@ class DemoBlockAttentionAnalyzer:
     def generate_mock_attention(self, 
                                  blocks: List[SemanticBlock],
                                  pattern: str = "realistic") -> np.ndarray:
-        """
-        生成模拟的block-level attention矩阵
-        
-        Args:
-            pattern: 
-                - "realistic": 模拟真实的attention模式
-                - "random": 随机attention
-                - "diagonal": 对角线模式
-        """
+        """生成模拟的block-level attention矩阵"""
         n = len(blocks)
         
         if pattern == "random":
@@ -899,40 +1546,28 @@ class DemoBlockAttentionAnalyzer:
             for i in range(n):
                 for j in range(n):
                     if j > i:
-                        # Causal: 不能看未来
                         attn[i, j] = 0
                     elif i == j:
-                        # 自注意力
                         attn[i, j] = np.random.uniform(0.3, 0.5)
                     else:
-                        # 基于block类型设置attention强度
                         query_type = blocks[i].block_type
                         key_type = blocks[j].block_type
                         
-                        # System prompt 通常被强烈关注
                         if key_type == "system_init":
                             attn[i, j] = np.random.uniform(0.2, 0.4)
-                            
-                        # Tool call 关注 tool response
                         elif query_type == "tool_call" and key_type == "tool_response":
                             attn[i, j] = np.random.uniform(0.15, 0.3)
-                            
-                        # Answer 关注 think
                         elif query_type == "answer" and key_type == "think":
                             attn[i, j] = np.random.uniform(0.2, 0.35)
-                            
-                        # Think 关注所有之前的内容
                         elif query_type == "think":
                             distance = i - j
                             attn[i, j] = np.random.uniform(0.1, 0.2) / (1 + distance * 0.1)
-                            
                         else:
                             distance = i - j
                             attn[i, j] = np.random.uniform(0.05, 0.15) / (1 + distance * 0.2)
         else:
             attn = np.random.rand(n, n)
             
-        # 归一化每行
         row_sums = attn.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1
         attn = attn / row_sums
@@ -947,7 +1582,6 @@ class DemoBlockAttentionAnalyzer:
         for i, block in enumerate(blocks):
             print(f"  [{i}] {block.block_type} (turn {block.turn_idx}, {block.token_count} tokens)")
         
-        # 生成模拟的attention
         block_attention_layer_21 = self.generate_mock_attention(blocks, "realistic")
         block_attention_layer_31 = self.generate_mock_attention(blocks, "realistic")
         
@@ -979,7 +1613,7 @@ class DemoBlockAttentionAnalyzer:
 
 
 # ============================================================================
-# 8. 使用示例
+# 9. 使用示例
 # ============================================================================
 
 def create_example_messages():
@@ -1035,49 +1669,99 @@ def main_demo():
     print("Block Attention Map Visualization - Demo Mode")
     print("=" * 60)
     
-    # 创建示例消息
     messages = create_example_messages()
-    
-    # 使用演示分析器
     demo_analyzer = DemoBlockAttentionAnalyzer()
-    
-    # 分析
     result = demo_analyzer.demo_analyze(messages)
-    
-    # 可视化
     demo_analyzer.visualize_demo(result)
     
     return result
 
 
-def main_real(model_path: str, json_path: str = None):
+def main_real(model_path: str, 
+              json_path: str = None,
+              use_4bit: bool = False,
+              use_8bit: bool = False,
+              use_sampling: bool = False,
+              use_chunked: bool = False):
     """
     使用真实模型的主函数
     
     Args:
         model_path: 模型路径
         json_path: 可选的JSON数据路径
+        use_4bit: 是否使用4bit量化
+        use_8bit: 是否使用8bit量化
+        use_sampling: 是否使用采样方式（更省显存）
+        use_chunked: 是否使用分块处理
     """
     print("=" * 60)
     print("Block Attention Map Visualization - Real Model Mode")
     print("=" * 60)
     
-    # 初始化分析器
-    analyzer = BlockAttentionAnalyzer(
-        model_name_or_path=model_path,
-        device_map="auto",
-        torch_dtype=torch.float16
-    )
+    # 打印GPU信息
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"GPU {i}: {props.name}, {props.total_memory / 1024**3:.1f} GB")
     
     # 准备消息
     if json_path:
-        result = analyzer.analyze_from_json(json_path)
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            messages = data[0]["messages"]
+        else:
+            messages = data["messages"]
     else:
         messages = create_example_messages()
-        result = analyzer.analyze_conversation(messages)
+    
+    if use_sampling:
+        # 使用采样分析器
+        analyzer = LightweightBlockAttentionAnalyzer(
+            model_name_or_path=model_path,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            sample_ratio=0.1,
+            max_samples_per_block=50
+        )
+        result = analyzer.analyze_with_sampling(messages)
+    else:
+        # 使用标准分析器
+        analyzer = BlockAttentionAnalyzer(
+            model_name_or_path=model_path,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            load_in_4bit=use_4bit,
+            load_in_8bit=use_8bit
+        )
+        
+        if use_chunked:
+            result = analyzer.analyze_conversation(
+                messages, 
+                use_chunked=True, 
+                chunk_size=2048
+            )
+        else:
+            # 使用顺序分析方法（最省显存）
+            result = analyzer.analyze_conversation_sequential(messages)
     
     # 可视化
-    analyzer.visualize_results(result, save_dir="./attention_maps")
+    analyzer.visualizer = BlockAttentionVisualizer()
+    
+    blocks = result["blocks"]
+    attention_maps = result["block_attention_maps"]
+    
+    for layer_idx, block_attn in attention_maps.items():
+        analyzer.visualizer.plot_attention_map(
+            block_attn, blocks, layer_idx,
+            save_path=f"./attention_maps/block_attention_layer_{layer_idx}.png"
+        )
+    
+    if len(attention_maps) > 1:
+        analyzer.visualizer.plot_multi_layer_comparison(
+            attention_maps, blocks,
+            save_path="./attention_maps/block_attention_comparison.png"
+        )
     
     return result
 
@@ -1089,13 +1773,21 @@ def main_real(model_path: str, json_path: str = None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Block Attention Map Visualization")
+    parser = argparse.ArgumentParser(description="Block Attention Map Visualization (Optimized)")
     parser.add_argument("--mode", type=str, default="demo", choices=["demo", "real"],
-                       help="运行模式: demo (演示模式，不需要模型) 或 real (需要实际模型)")
+                       help="运行模式: demo (演示模式) 或 real (需要实际模型)")
     parser.add_argument("--model", type=str, default=None,
                        help="模型路径 (仅在real模式下需要)")
     parser.add_argument("--json", type=str, default=None,
                        help="输入JSON文件路径")
+    parser.add_argument("--use-4bit", action="store_true",
+                       help="使用4bit量化以节省显存")
+    parser.add_argument("--use-8bit", action="store_true",
+                       help="使用8bit量化以节省显存")
+    parser.add_argument("--use-sampling", action="store_true",
+                       help="使用采样方式分析（最省显存）")
+    parser.add_argument("--use-chunked", action="store_true",
+                       help="使用分块处理长序列")
     
     args = parser.parse_args()
     
@@ -1105,4 +1797,11 @@ if __name__ == "__main__":
         if not args.model:
             print("Error: --model is required in real mode")
             exit(1)
-        result = main_real(args.model, args.json)
+        result = main_real(
+            args.model, 
+            args.json,
+            use_4bit=args.use_4bit,
+            use_8bit=args.use_8bit,
+            use_sampling=args.use_sampling,
+            use_chunked=args.use_chunked
+        )
