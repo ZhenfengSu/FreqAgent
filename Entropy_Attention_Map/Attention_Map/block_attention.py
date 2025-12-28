@@ -234,34 +234,108 @@ class OptimizedAttentionExtractor:
         """
         创建一个会实时聚合attention的hook
         这样可以避免存储完整的[num_heads, seq_len, seq_len]矩阵
+        优化版本：分块处理attention以避免OOM
         """
         def hook(module, input, output):
             # output通常是 (attn_output, attn_weights, past_key_value)
             if isinstance(output, tuple) and len(output) >= 2:
                 attn_weights = output[1]  # [batch, num_heads, seq_len, seq_len]
                 if attn_weights is not None:
-                    # 立即在GPU上进行head聚合，然后转移到CPU
-                    # 这样可以减少数据传输量
                     with torch.no_grad():
-                        # 对heads取平均: [batch, num_heads, seq_len, seq_len] -> [batch, seq_len, seq_len]
-                        attn_mean = attn_weights.mean(dim=1)
-                        
                         if self.blocks is not None:
-                            # 实时计算block-level attention
-                            block_attn = self._compute_block_attention_gpu(
-                                attn_mean[0], self.blocks
+                            # 直接在GPU上计算block attention，避免创建完整的聚合矩阵
+                            block_attn = self._compute_block_attention_chunked_gpu(
+                                attn_weights[0], self.blocks
                             )
                             self.block_attention_cache[layer_idx] = block_attn
                         else:
-                            # 如果没有blocks信息，存储聚合后的attention
-                            self.temp_attention = attn_mean[0].cpu().numpy()
-                            
+                            # 如果没有blocks信息，分块处理并聚合
+                            attn_mean = self._aggregate_heads_chunked(attn_weights[0])
+                            self.temp_attention = attn_mean
+
                     # 显式释放GPU内存
                     del attn_weights
                     torch.cuda.empty_cache()
-                    
+
         return hook
-    
+
+    def _aggregate_heads_chunked(self, attn_weights: torch.Tensor, chunk_size: int = 4096) -> np.ndarray:
+        """
+        分块聚合多头attention，避免一次性处理整个矩阵
+        Args:
+            attn_weights: [num_heads, seq_len, seq_len]
+            chunk_size: 每次处理的序列长度
+        Returns:
+            聚合后的attention矩阵 (numpy array on CPU)
+        """
+        num_heads, seq_len, _ = attn_weights.shape
+
+        # 如果序列长度小于chunk_size，直接处理
+        if seq_len <= chunk_size:
+            attn_mean = attn_weights.mean(dim=0).cpu().numpy()
+            del attn_weights
+            return attn_mean
+
+        # 分块处理
+        result = np.zeros((seq_len, seq_len), dtype=np.float32)
+
+        for i in range(0, seq_len, chunk_size):
+            end_i = min(i + chunk_size, seq_len)
+            # 只处理当前行块
+            chunk = attn_weights[:, i:end_i, :].mean(dim=0).cpu().numpy()
+            result[i:end_i, :] = chunk
+            del chunk
+            torch.cuda.empty_cache()
+
+        del attn_weights
+        return result
+
+    def _compute_block_attention_chunked_gpu(self,
+                                              attn_weights: torch.Tensor,
+                                              blocks: List[SemanticBlock],
+                                              head_chunk_size: int = 8) -> np.ndarray:
+        """
+        分块计算block attention，避免OOM
+        先分块聚合heads，再计算block attention
+
+        Args:
+            attn_weights: [num_heads, seq_len, seq_len] on GPU
+            blocks: 语义块列表
+            head_chunk_size: 每次处理的head数量
+        """
+        num_heads, seq_len, _ = attn_weights.shape
+        num_blocks = len(blocks)
+
+        # 初始化block attention累加器
+        block_attention = np.zeros((num_blocks, num_blocks), dtype=np.float32)
+
+        # 分块处理heads
+        for h_start in range(0, num_heads, head_chunk_size):
+            h_end = min(h_start + head_chunk_size, num_heads)
+
+            # 聚合当前head chunk
+            attn_chunk = attn_weights[h_start:h_end].mean(dim=0)  # [seq_len, seq_len]
+
+            # 计算block attention并累加
+            for i, block_i in enumerate(blocks):
+                for j, block_j in enumerate(blocks):
+                    start_i = min(block_i.start_idx, seq_len - 1)
+                    end_i = min(block_i.end_idx, seq_len)
+                    start_j = min(block_j.start_idx, seq_len - 1)
+                    end_j = min(block_j.end_idx, seq_len)
+
+                    if end_i > start_i and end_j > start_j:
+                        sub_matrix = attn_chunk[start_i:end_i, start_j:end_j]
+                        block_attention[i, j] += sub_matrix.mean().cpu().item() * (h_end - h_start)
+
+            del attn_chunk
+            torch.cuda.empty_cache()
+
+        # 平均
+        block_attention /= num_heads
+
+        return block_attention
+
     def _compute_block_attention_gpu(self, 
                                       attention_matrix: torch.Tensor,
                                       blocks: List[SemanticBlock]) -> np.ndarray:
@@ -798,14 +872,15 @@ class BlockAttentionAnalyzer:
     针对大模型进行了显存优化
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model_name_or_path: str,
                  device_map: str = "auto",
                  torch_dtype = torch.float16,
                  use_flash_attn: bool = False,
                  load_in_8bit: bool = False,
                  load_in_4bit: bool = False,
-                 max_memory: Dict[int, str] = None):
+                 max_memory: Dict[int, str] = None,
+                 use_gradient_checkpointing: bool = False):
         """
         Args:
             model_name_or_path: 模型路径或HuggingFace模型名
@@ -815,6 +890,7 @@ class BlockAttentionAnalyzer:
             load_in_8bit: 是否使用8bit量化
             load_in_4bit: 是否使用4bit量化
             max_memory: 每张卡的最大显存使用，如 {0: "20GiB", 1: "20GiB", ...}
+            use_gradient_checkpointing: 是否使用梯度检查点（可以显著减少显存，但会增加计算时间）
         """
         print(f"Loading model: {model_name_or_path}")
         
@@ -865,7 +941,12 @@ class BlockAttentionAnalyzer:
             low_cpu_mem_usage=True
         )
         self.model.eval()
-        
+
+        # 启用梯度检查点以节省显存
+        if use_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled")
+
         # 计算层索引
         self.num_layers = self._get_num_layers()
         self.layer_2_3 = int(self.num_layers * 2 / 3)
@@ -1004,7 +1085,17 @@ class BlockAttentionAnalyzer:
                 
                 with torch.no_grad():
                     try:
-                        self.model(input_ids_device, output_attentions=False, use_cache=False)
+                        # 使用use_cache=False避免存储past_key_values
+                        # 使用output_attentions=False避免存储所有层的attention
+                        outputs = self.model(
+                            input_ids_device,
+                            output_attentions=False,
+                            use_cache=False,
+                            return_dict=True
+                        )
+                        # 立即删除outputs以释放显存
+                        del outputs
+                        torch.cuda.empty_cache()
                     except RuntimeError as e:
                         if "out of memory" in str(e):
                             print(f"OOM on layer {layer_idx}, trying chunked extraction...")
@@ -1136,10 +1227,17 @@ class BlockAttentionAnalyzer:
                 # 前向传播
                 input_device = self._get_layer_device(0)
                 input_ids_device = input_ids.to(input_device)
-                
+
                 with torch.no_grad():
-                    self.model(input_ids_device, output_attentions=False, use_cache=False)
-                
+                    outputs = self.model(
+                        input_ids_device,
+                        output_attentions=False,
+                        use_cache=False,
+                        return_dict=True
+                    )
+                    del outputs
+                    torch.cuda.empty_cache()
+
                 # 获取结果
                 if result_container["block_attention"] is not None:
                     block_attn = self.aggregator.normalize(
@@ -1392,8 +1490,15 @@ class LightweightBlockAttentionAnalyzer:
             try:
                 input_device = next(self.model.parameters()).device
                 with torch.no_grad():
-                    self.model(input_ids.to(input_device), output_attentions=False, use_cache=False)
-                
+                    outputs = self.model(
+                        input_ids.to(input_device),
+                        output_attentions=False,
+                        use_cache=False,
+                        return_dict=True
+                    )
+                    del outputs
+                    torch.cuda.empty_cache()
+
                 if result_container["attn"] is not None:
                     attn = result_container["attn"].numpy()
                     
@@ -1677,15 +1782,16 @@ def main_demo():
     return result
 
 
-def main_real(model_path: str, 
+def main_real(model_path: str,
               json_path: str = None,
               use_4bit: bool = False,
               use_8bit: bool = False,
               use_sampling: bool = False,
-              use_chunked: bool = False):
+              use_chunked: bool = False,
+              use_gradient_checkpointing: bool = False):
     """
     使用真实模型的主函数
-    
+
     Args:
         model_path: 模型路径
         json_path: 可选的JSON数据路径
@@ -1693,6 +1799,7 @@ def main_real(model_path: str,
         use_8bit: 是否使用8bit量化
         use_sampling: 是否使用采样方式（更省显存）
         use_chunked: 是否使用分块处理
+        use_gradient_checkpointing: 是否使用梯度检查点
     """
     print("=" * 60)
     print("Block Attention Map Visualization - Real Model Mode")
@@ -1732,9 +1839,10 @@ def main_real(model_path: str,
             device_map="auto",
             torch_dtype=torch.float16,
             load_in_4bit=use_4bit,
-            load_in_8bit=use_8bit
+            load_in_8bit=use_8bit,
+            use_gradient_checkpointing=use_gradient_checkpointing
         )
-        
+
         if use_chunked:
             result = analyzer.analyze_conversation(
                 messages, 
@@ -1788,7 +1896,9 @@ if __name__ == "__main__":
                        help="使用采样方式分析（最省显存）")
     parser.add_argument("--use-chunked", action="store_true",
                        help="使用分块处理长序列")
-    
+    parser.add_argument("--use-gradient-checkpointing", action="store_true",
+                       help="使用梯度检查点以节省显存（推荐用于32k输入）")
+
     args = parser.parse_args()
     
     if args.mode == "demo":
@@ -1798,10 +1908,11 @@ if __name__ == "__main__":
             print("Error: --model is required in real mode")
             exit(1)
         result = main_real(
-            args.model, 
+            args.model,
             args.json,
             use_4bit=args.use_4bit,
             use_8bit=args.use_8bit,
             use_sampling=args.use_sampling,
-            use_chunked=args.use_chunked
+            use_chunked=args.use_chunked,
+            use_gradient_checkpointing=args.use_gradient_checkpointing
         )
