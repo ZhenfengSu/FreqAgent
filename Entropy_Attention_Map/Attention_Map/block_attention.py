@@ -1183,23 +1183,73 @@ Calculate 25 * 47."""
 def main():
     """主函数"""
     import sys
+    import os
     
-    # 检查命令行参数
-    if len(sys.argv) > 1:
-        model_path = sys.argv[1]
+    # 解析命令行参数
+    args = parse_arguments()
+    
+    model_path = args.model
+    json_path = args.json
+    sample_idx = args.sample_idx
+    save_path = args.output
+    target_layers = args.layers
+    
+    # 确定使用的消息
+    messages = None
+    if json_path:
+        # 从JSON文件加载消息
+        if not os.path.exists(json_path):
+            print(f"Error: JSON file not found: {json_path}")
+            sys.exit(1)
+        
+        print(f"Loading messages from JSON file: {json_path}")
+        print(f"Using sample index: {sample_idx}")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        if isinstance(data, list):
+            if sample_idx >= len(data):
+                print(f"Error: sample_idx {sample_idx} out of range (total samples: {len(data)})")
+                sys.exit(1)
+            sample = data[sample_idx]
+        else:
+            sample = data
+        
+        messages = sample.get('messages', sample)
+        print(f"Loaded {len(messages)} messages from JSON")
+        
+        # 显示消息概览
+        print("\nMessages overview:")
+        for idx, msg in enumerate(messages[:5]):  # 只显示前5条
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            content_preview = content[:100] + "..." if len(content) > 100 else content
+            print(f"  [{idx}] {role}: {content_preview}")
+        if len(messages) > 5:
+            print(f"  ... and {len(messages) - 5} more messages")
+        print()
     else:
-        model_path = "/mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B"
-    
-    messages = create_sample_messages()
+        # 使用示例消息
+        messages = create_sample_messages()
+        print("Using default sample messages\n")
     
     print("="*60)
     print("Block Attention Map Analyzer")
     print("="*60)
     
     try:
+        # 如果指定了layers参数，转换为整数列表
+        if target_layers:
+            try:
+                target_layers = [int(l) for l in target_layers.split(',')]
+            except ValueError:
+                print(f"Error: Invalid layers format '{target_layers}'. Expected comma-separated integers.")
+                sys.exit(1)
+        
         analyzer = BlockAttentionAnalyzer(
             model_name_or_path=model_path,
-            target_layers=None,
+            target_layers=target_layers,
             device_map="auto",
             torch_dtype=torch.float16
         )
@@ -1207,7 +1257,7 @@ def main():
         results = analyzer.analyze(
             messages=messages,
             visualize=True,
-            save_path="block_attention_map.png"
+            save_path=save_path
         )
         
         print("\n" + "="*60)
@@ -1220,6 +1270,79 @@ def main():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)
+
+
+def parse_arguments():
+    """解析命令行参数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Block Attention Map Analyzer - Analyze attention patterns in transformer models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 使用默认示例消息
+  python block_attention.py
+  
+  # 指定模型路径
+  python block_attention.py --model /path/to/model
+  
+  # 从JSON文件加载第一条消息
+  python block_attention.py --json trajectories.json
+  
+  # 从JSON文件加载指定索引的消息
+  python block_attention.py --json trajectories.json --sample_idx 5
+  
+  # 指定分析层并自定义输出路径
+  python block_attention.py --json trajectories.json --layers 20,25 --output my_result.png
+  
+  # 完整示例
+  python block_attention.py \\
+      --model /mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B \\
+      --json trajectories.json \\
+      --sample_idx 0 \\
+      --layers 20,25 \\
+      --output attention_map.png
+        """
+    )
+    
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='/mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B',
+        help='Path or name of the pre-trained model (default: WebSailor-3B)'
+    )
+    
+    parser.add_argument(
+        '--json',
+        type=str,
+        default=None,
+        help='Path to JSON file containing conversation data'
+    )
+    
+    parser.add_argument(
+        '--sample_idx',
+        type=int,
+        default=0,
+        help='Index of sample to analyze from JSON file (default: 0)'
+    )
+    
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='block_attention_map.png',
+        help='Output path for the attention map visualization (default: block_attention_map.png)'
+    )
+    
+    parser.add_argument(
+        '--layers',
+        type=str,
+        default=None,
+        help='Comma-separated list of layer indices to analyze (default: auto-select)'
+    )
+    
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
