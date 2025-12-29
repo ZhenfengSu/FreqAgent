@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 @dataclass
 class SemanticBlock:
     """语义块数据结构"""
-    block_type: str  # system_init, think, tool_call, tool_response, answer
+    block_type: str  # system_init, think, tool_call, tool_response, answer, other
     content: str
     start_idx: int
     end_idx: int
@@ -324,7 +324,6 @@ class SemanticBlockParser:
             input_ids = input_ids[0]
         
         total_tokens = len(input_ids)
-        full_text = self.tokenizer.decode(input_ids, skip_special_tokens=False)
         
         blocks = []
         
@@ -343,14 +342,16 @@ class SemanticBlockParser:
             end_pos = min(current_pos + msg_tokens, total_tokens)
             
             if role == 'system_init':
+                # system_init 块：解析其中的特殊标签，未匹配部分仍为 system_init
                 sub_blocks = self._parse_content_into_blocks(
-                    content, current_pos, end_pos, turn_idx, 'system'
+                    content, current_pos, end_pos, turn_idx, 'system', is_system=True
                 )
                 blocks.extend(sub_blocks)
                 
             elif role == 'assistant':
+                # assistant 块：解析特殊标签，未匹配部分为 other
                 sub_blocks = self._parse_content_into_blocks(
-                    content, current_pos, end_pos, turn_idx, 'assistant'
+                    content, current_pos, end_pos, turn_idx, 'assistant', is_system=False
                 )
                 blocks.extend(sub_blocks)
                 
@@ -373,6 +374,9 @@ class SemanticBlockParser:
         
         # 验证并修复block边界
         blocks = self._validate_and_fix_blocks(blocks, total_tokens)
+        
+        # 后处理：只有最后一个 answer 块保留为 answer，其他改为 other
+        blocks = self._postprocess_answer_blocks(blocks)
         
         return blocks
     
@@ -410,20 +414,32 @@ class SemanticBlockParser:
         start_pos: int,
         end_pos: int,
         turn_idx: int,
-        role: str
+        role: str,
+        is_system: bool = False
     ) -> List[SemanticBlock]:
-        """将内容解析为多个语义块"""
+        """
+        将内容解析为多个语义块
+        
+        Args:
+            content: 消息内容
+            start_pos: 起始token位置
+            end_pos: 结束token位置
+            turn_idx: 对话轮次
+            role: 角色
+            is_system: 是否为system块（决定未匹配内容的标签）
+        """
         blocks = []
         total_tokens = end_pos - start_pos
         
         if total_tokens <= 0:
             return blocks
         
-        # 定义匹配模式
+        # 定义匹配模式 - 添加 answer 标签
         patterns = [
             (r'<think>(.*?)</think>', 'think'),
             (r'<tool_call>(.*?)</tool_call>', 'tool_call'),
             (r'<tool_calls>(.*?)</tool_calls>', 'tool_call'),
+            (r'<answer>(.*?)</answer>', 'answer'),  # 新增 answer 标签
         ]
         
         # 找所有匹配
@@ -434,16 +450,19 @@ class SemanticBlockParser:
                     'char_start': m.start(),
                     'char_end': m.end(),
                     'text': m.group(0),
+                    'inner_text': m.group(1),  # 标签内部的内容
                     'type': block_type
                 })
         
         matches.sort(key=lambda x: x['char_start'])
         
+        # 确定未匹配内容的默认类型
+        default_type = 'system_init' if is_system else 'other'
+        
         if not matches:
             # 没有特殊标签
-            block_type = 'system_init' if role == 'system' else 'answer'
             blocks.append(SemanticBlock(
-                block_type=block_type,
+                block_type=default_type,
                 content=self._truncate(content),
                 start_idx=start_pos,
                 end_idx=end_pos,
@@ -466,7 +485,7 @@ class SemanticBlockParser:
                         token_end = min(current_token + token_count, end_pos)
                         
                         blocks.append(SemanticBlock(
-                            block_type='answer' if role == 'assistant' else 'system_init',
+                            block_type=default_type,
                             content=self._truncate(text_before),
                             start_idx=current_token,
                             end_idx=token_end,
@@ -496,13 +515,36 @@ class SemanticBlockParser:
                 remaining = content[current_char:].strip()
                 if remaining:
                     blocks.append(SemanticBlock(
-                        block_type='answer' if role == 'assistant' else 'system_init',
+                        block_type=default_type,
                         content=self._truncate(remaining),
                         start_idx=current_token,
                         end_idx=end_pos,
                         role=role,
                         turn_idx=turn_idx
                     ))
+        
+        return blocks
+    
+    def _postprocess_answer_blocks(self, blocks: List[SemanticBlock]) -> List[SemanticBlock]:
+        """
+        后处理：只保留最后一个 answer 块为 answer 类型，其他 answer 块改为 other
+        
+        Args:
+            blocks: 语义块列表
+            
+        Returns:
+            处理后的语义块列表
+        """
+        # 找到所有 answer 块的索引
+        answer_indices = [i for i, b in enumerate(blocks) if b.block_type == 'answer']
+        
+        if len(answer_indices) <= 1:
+            # 只有0个或1个answer块，无需处理
+            return blocks
+        
+        # 除了最后一个，其他都改为 other
+        for idx in answer_indices[:-1]:
+            blocks[idx].block_type = 'other'
         
         return blocks
     
@@ -641,7 +683,8 @@ class BlockAttentionCalculator:
             'tool_call': 'CALL',
             'tool_response': 'RESP',
             'answer': 'ANS',
-            'user_message': 'USR'
+            'user_message': 'USR',
+            'other': 'OTH'  # 新增 other 标签
         }
         for block in self.blocks:
             abbrev = type_abbrev.get(block.block_type, block.block_type[:4].upper())
@@ -662,7 +705,8 @@ class BlockAttentionVisualizer:
             'tool_call': '#98FB98',
             'tool_response': '#ADD8E6',
             'answer': '#DDA0DD',
-            'user_message': '#F0E68C'
+            'user_message': '#F0E68C',
+            'other': '#D3D3D3'  # 新增 other 颜色（浅灰色）
         }
         
     def plot_attention_map(
@@ -690,7 +734,8 @@ class BlockAttentionVisualizer:
             'tool_call': 'CALL',
             'tool_response': 'RESP',
             'answer': 'ANS',
-            'user_message': 'USR'
+            'user_message': 'USR',
+            'other': 'OTH'
         }
         for block in blocks:
             abbrev = type_abbrev.get(block.block_type, block.block_type[:4])
@@ -809,7 +854,7 @@ class BlockAttentionVisualizer:
             plt.Rectangle((0,0), 1, 1, facecolor=color, label=block_type)
             for block_type, color in self.type_colors.items()
         ]
-        ax.legend(handles=legend_elements, loc='upper right', ncol=3, fontsize=8)
+        ax.legend(handles=legend_elements, loc='upper right', ncol=4, fontsize=8)
         
         plt.tight_layout()
         
@@ -1092,7 +1137,7 @@ def create_sample_messages():
         },
         {
             "role": "assistant",
-            "content": "The result of 25 × 47 is **1175**. This number is not prime - it can be factored as 5² × 47."
+            "content": "<answer>The result of 25 × 47 is **1175**. This number is not prime - it can be factored as 5² × 47.</answer>"
         }
     ]
 
