@@ -10,6 +10,12 @@ MODEL_PATH="/mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B"
 # python block_attention.py --json trajectories.json --sample_idx 5
 
 # 完整示例
+# python block_attention.py \
+#     --model /mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B \
+#     --json trajectories.json \
+#     --sample_idx 0 \
+#     --layers 20,25 \
+#     --output attention_map.png --show_values
 python block_attention.py \
     --model /mnt/lc_share/modelscope/models/Qwen/WebAgent/WebSailor-3B \
     --json trajectories.json \

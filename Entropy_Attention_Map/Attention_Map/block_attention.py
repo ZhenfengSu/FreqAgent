@@ -699,7 +699,7 @@ class BlockAttentionVisualizer:
         # 设置刻度
         ax.set_xticks(range(len(labels)))
         ax.set_yticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        ax.set_xticklabels(labels, rotation=90, ha='center', fontsize=8)
         ax.set_yticklabels(labels, fontsize=8)
         
         # 添加数值标注
@@ -727,9 +727,18 @@ class BlockAttentionVisualizer:
         attention_maps: Dict[int, np.ndarray],
         blocks: List[SemanticBlock],
         save_path: str = None,
-        title_prefix: str = ""
+        title_prefix: str = "",
+        show_values: bool = True
     ):
-        """绘制多层attention对比图"""
+        """绘制多层attention对比图
+        
+        Args:
+            attention_maps: attention字典
+            blocks: 语义块列表
+            save_path: 保存路径
+            title_prefix: 标题前缀
+            show_values: 是否显示attention值
+        """
         n_layers = len(attention_maps)
         if n_layers == 0:
             print("No attention maps to plot!")
@@ -750,7 +759,8 @@ class BlockAttentionVisualizer:
                 blocks, 
                 layer_idx,
                 title=f"{title_prefix}Layer {layer_idx}" if title_prefix else f"Layer {layer_idx}",
-                ax=axes[idx]
+                ax=axes[idx],
+                show_values=show_values
             )
         
         plt.tight_layout()
@@ -873,7 +883,8 @@ class BlockAttentionAnalyzer:
         messages: List[Dict],
         visualize: bool = True,
         save_path: str = None,
-        show_block_layout: bool = False
+        show_block_layout: bool = False,
+        show_values: bool = True
     ) -> Dict[str, Any]:
         """
         分析单个对话的Block Attention
@@ -883,6 +894,7 @@ class BlockAttentionAnalyzer:
             visualize: 是否可视化
             save_path: 图片保存路径
             show_block_layout: 是否显示block布局图
+            show_values: 是否显示attention值
             
         Returns:
             分析结果字典
@@ -938,7 +950,8 @@ class BlockAttentionAnalyzer:
             self.visualizer.plot_comparison(
                 block_attention_maps,
                 blocks,
-                save_path=save_path
+                save_path=save_path,
+                show_values=show_values
             )
         
         return {
@@ -1039,6 +1052,10 @@ Examples:
     parser.add_argument(
         '--show_layout', action='store_true',
         help='Show block layout visualization'
+    )
+    parser.add_argument(
+        '--show_values', action='store_true',
+        help='Show attention values in the heatmap'
     )
     
     return parser.parse_args()
@@ -1146,7 +1163,8 @@ def main():
             messages=messages,
             visualize=True,
             save_path=args.output,
-            show_block_layout=args.show_layout
+            show_block_layout=args.show_layout,
+            show_values=args.show_values
         )
         
         print("\n" + "="*60)
