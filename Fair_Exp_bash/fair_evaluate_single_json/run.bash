@@ -1,0 +1,1 @@
+python eval.py --input_file /path/to/predictions.jsonl --dataset gaia
